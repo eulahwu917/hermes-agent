@@ -14,7 +14,8 @@ logger = logging.getLogger(__name__.rpartition(".")[0])
 _DEFAULT_API_URL = "https://api.hindsight.vectorize.io"
 _DEFAULT_LOCAL_URL = "http://localhost:8888"
 # Keep in sync with tools/lazy_deps.py ("memory.hindsight") and plugin.yaml.
-_MIN_CLIENT_VERSION = "0.6.1"
+# Our pin — upstream still at 0.6.1; keep on rebase (PR #71122 carries 0.8.5 support).
+_MIN_CLIENT_VERSION = "0.8.5"
 _DEFAULT_TIMEOUT = 120  # seconds — cloud API can take 30-40s per request
 _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
 # ``metadata.source`` on retained memories is OPT-IN (AGENTS.md forbids
@@ -104,6 +105,62 @@ def _normalize_observation_scopes(value: Any) -> Any:
         for entry in value
     ]
     return [s for s in scopes if s] or None
+
+
+_VALID_MIN_SCORE_KEYS = frozenset({"semantic", "keyword", "reranker", "final"})
+
+
+def _normalize_min_scores(value):
+    """Validate and normalize a ``recall_min_scores`` config value.
+
+    Returns a ``{stage: floor}`` dict ready to pass as ``min_scores`` to
+    ``client.arecall()``, or ``None`` if the config is unset / entirely invalid
+    (fail-open: no relevance floor applied).
+
+    Only the four known stage keys are accepted (0.8.5 client raises
+    ``ValueError`` on unknown keys).  Non-numeric values are dropped with a
+    ``logger.warning``.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        logger.warning("recall_min_scores: expected dict, got %s — ignoring", type(value).__name__)
+        return None
+
+    result = {}
+    for key, raw in value.items():
+        key_str = str(key)
+        if key_str not in _VALID_MIN_SCORE_KEYS:
+            logger.warning(
+                "recall_min_scores: unknown key %r (must be one of %s) — dropping",
+                key_str,
+                ", ".join(sorted(_VALID_MIN_SCORE_KEYS)),
+            )
+            continue
+        try:
+            v = float(raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                "recall_min_scores: key %r has non-numeric value %r — dropping",
+                key_str,
+                raw,
+            )
+            continue
+        # Range-clamp bounded stages (keyword uses BM25 which is unbounded ≥0).
+        if key_str in {"semantic", "reranker", "final"} and not (0.0 <= v <= 1.0):
+            logger.warning(
+                "recall_min_scores: %r value %s outside [0,1] — clamping",
+                key_str, v,
+            )
+            v = min(1.0, max(0.0, v))
+        if v < 0.0:
+            logger.warning(
+                "recall_min_scores: %r value %s is negative — dropping", key_str, v,
+            )
+            continue
+        result[key_str] = v
+
+    return result or None
 
 
 def _sanitize_bank_segment(value: str) -> str:
