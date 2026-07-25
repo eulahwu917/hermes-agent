@@ -510,13 +510,22 @@ def _normalize_min_scores(value: Any) -> Optional[Dict[str, float]]:
             )
             continue
         try:
-            result[key_str] = float(raw)
+            v = float(raw)
         except (TypeError, ValueError):
             logger.warning(
                 "recall_min_scores: key %r has non-numeric value %r — dropping",
                 key_str,
                 raw,
             )
+            continue
+        # Range-clamp bounded stages (keyword uses BM25 which is unbounded ≥0).
+        if key_str in {"semantic", "reranker", "final"} and not (0.0 <= v <= 1.0):
+            logger.warning(
+                "recall_min_scores: %r value %s outside [0,1] — clamping",
+                key_str, v,
+            )
+            v = max(0.0, min(1.0, v))
+        result[key_str] = v
 
     return result or None
 
@@ -749,6 +758,12 @@ class HindsightMemoryProvider(MemoryProvider):
         self._recall_types: list[str] = ["observation"]
         self._recall_prompt_preamble = ""
         self._recall_max_input_chars = 800
+
+        # v0.8.4+ recall parameters (prefer_observations, min_scores).
+        # Constructor defaults so any pre-initialize read never raises
+        # AttributeError. Actual values are set in initialize().
+        self._prefer_observations = False
+        self._recall_min_scores: dict | None = None
 
         # Bank
         self._bank_mission = ""
@@ -1046,6 +1061,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "recall_max_tokens", "description": "Maximum tokens for recall results", "default": 4096},
             {"key": "recall_max_input_chars", "description": "Maximum input query length for auto-recall", "default": 800},
             {"key": "recall_min_scores", "description": "Relevance score floors applied to RECALL ONLY (not reflect — server-side limitation). Dict mapping stage name to minimum score, e.g. {\"reranker\": 0.01}. Valid stages: semantic, keyword, reranker, final.", "default": {}},
+            {"key": "prefer_observations", "description": "When recalling observation+raw facts together, drop raw facts superseded by consolidated observations. Requires Hindsight >= 0.8.4. Has no effect when recall_types is observation-only (the default).", "default": False},
             {"key": "recall_prompt_preamble", "description": "Custom preamble for recalled memories in context"},
             {"key": "timeout", "description": "API request timeout in seconds", "default": _DEFAULT_TIMEOUT},
             {"key": "idle_timeout", "description": "Embedded daemon idle timeout in seconds (0 disables auto-shutdown)", "default": _DEFAULT_IDLE_TIMEOUT, "when": {"mode": "local_embedded"}},
@@ -1401,6 +1417,33 @@ class HindsightMemoryProvider(MemoryProvider):
             self._config.get("recall_min_scores")
         )
 
+        # prefer_observations: pass through to arecall when configured. When
+        # recall_types is observation-only (the default), this flag has no
+        # effect — it only matters when at least one raw type (world/experience)
+        # is also included alongside observation. See runbook C3 decision.
+        self._prefer_observations = bool(
+            self._config.get("prefer_observations", False)
+        )
+
+        # Version guard (C4): if an installed hindsight-client < 0.8.4 would
+        # not accept these params, drop them gracefully (log warning, recall
+        # still proceeds) rather than raising TypeError.
+        if self._prefer_observations or self._recall_min_scores is not None:
+            try:
+                from importlib.metadata import version as _v
+                _installed_client = _v("hindsight-client")
+                if _meets_minimum_version(_installed_client, "0.8.4") is False:
+                    logger.warning(
+                        "v0.8.4 recall params (prefer_observations / min_scores) "
+                        "require hindsight-client >= 0.8.4 (installed: %s). "
+                        "Params disabled — recall will proceed without them.",
+                        _installed_client,
+                    )
+                    self._prefer_observations = False
+                    self._recall_min_scores = None
+            except Exception:
+                pass  # packaging/version not available — proceed
+
         self._retain_async = self._config.get("retain_async", True)
 
         _client_version = "unknown"
@@ -1562,6 +1605,13 @@ class HindsightMemoryProvider(MemoryProvider):
                         recall_kwargs["tags_match"] = self._recall_tags_match
                     if self._recall_types:
                         recall_kwargs["types"] = self._recall_types
+                    # prefer_observations: wired but inert unless recall_types
+                    # includes at least one raw type (world/experience) alongside
+                    # observation. Intentional per the hindsight-client-upgrade
+                    # runbook C3 decision — dormant-by-design, broadening
+                    # recall_types is deliberately out of scope for this patch.
+                    if self._prefer_observations:
+                        recall_kwargs["prefer_observations"] = self._prefer_observations
                     if self._recall_min_scores is not None:
                         recall_kwargs["min_scores"] = self._recall_min_scores
                     logger.debug("Prefetch: calling recall (bank=%s, query_len=%d, budget=%s)",
@@ -1793,6 +1843,11 @@ class HindsightMemoryProvider(MemoryProvider):
                     recall_kwargs["tags_match"] = self._recall_tags_match
                 if self._recall_types:
                     recall_kwargs["types"] = self._recall_types
+                # prefer_observations: wired but inert unless recall_types
+                # includes at least one raw type (world/experience) alongside
+                # observation (dormant-by-design, runbook C3).
+                if self._prefer_observations:
+                    recall_kwargs["prefer_observations"] = self._prefer_observations
                 if self._recall_min_scores is not None:
                     recall_kwargs["min_scores"] = self._recall_min_scores
                 logger.debug("Tool hindsight_recall: bank=%s, query_len=%d, budget=%s",

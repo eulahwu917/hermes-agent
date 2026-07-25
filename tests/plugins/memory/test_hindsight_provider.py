@@ -1939,3 +1939,79 @@ class TestRecallMinScores:
         call_kwargs = p._client.arecall.call_args.kwargs
         assert "min_scores" not in call_kwargs
         assert any("non-numeric" in rec.message.lower() for rec in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# prefer_observations wiring tests (+ combined with min_scores)
+# ---------------------------------------------------------------------------
+
+
+class TestPreferObservations:
+    """Verify prefer_observations reaches arecall at both call sites and that
+    the kwarg is omitted when the flag is False / unset."""
+
+    def test_prefetch_passes_prefer_observations(self, provider_with_config, monkeypatch):
+        """Auto-recall (prefetch) passes prefer_observations=True when configured."""
+        monkeypatch.setattr("importlib.metadata.version", lambda _: "0.8.5")
+        p = provider_with_config(prefer_observations=True)
+        p.queue_prefetch("test query")
+        if p._prefetch_thread:
+            p._prefetch_thread.join(timeout=5.0)
+
+        call_kwargs = p._client.arecall.call_args.kwargs
+        assert call_kwargs["prefer_observations"] is True
+
+    def test_tool_recall_passes_prefer_observations(self, provider_with_config, monkeypatch):
+        """Tool recall path passes prefer_observations=True when configured."""
+        monkeypatch.setattr("importlib.metadata.version", lambda _: "0.8.5")
+        p = provider_with_config(prefer_observations=True)
+        p.handle_tool_call("hindsight_recall", {"query": "test"})
+
+        call_kwargs = p._client.arecall.call_args.kwargs
+        assert call_kwargs["prefer_observations"] is True
+
+    def test_both_sites_omit_when_unset(self, provider_with_config, monkeypatch):
+        """When prefer_observations is False, the kwarg is omitted at both sites."""
+        # Tool call
+        monkeypatch.setattr("importlib.metadata.version", lambda _: "0.8.5")
+        p = provider_with_config(prefer_observations=False)
+        p.handle_tool_call("hindsight_recall", {"query": "t1"})
+        kwargs = p._client.arecall.call_args.kwargs
+        assert "prefer_observations" not in kwargs
+
+        # Prefetch (recreate provider)
+        p2 = provider_with_config(prefer_observations=False)
+        p2.queue_prefetch("t2")
+        if p2._prefetch_thread:
+            p2._prefetch_thread.join(timeout=5.0)
+        kwargs2 = p2._client.arecall.call_args.kwargs
+        assert "prefer_observations" not in kwargs2
+
+    def test_both_flags_together_in_same_call(self, provider_with_config, monkeypatch):
+        """prefer_observations AND recall_min_scores both reach arecall together."""
+        monkeypatch.setattr("importlib.metadata.version", lambda _: "0.8.5")
+        p = provider_with_config(
+            prefer_observations=True,
+            recall_min_scores={"reranker": 0.3, "semantic": 0.5},
+        )
+        p.handle_tool_call("hindsight_recall", {"query": "test"})
+        kwargs = p._client.arecall.call_args.kwargs
+        assert kwargs["prefer_observations"] is True
+        assert kwargs["min_scores"] == {"reranker": 0.3, "semantic": 0.5}
+
+    def test_version_guard_disables_on_old_client(self, provider_with_config, monkeypatch, caplog):
+        """v0.8.4 recall params are knocked out when hindsight-client < 0.8.4."""
+        monkeypatch.setattr("importlib.metadata.version", lambda _: "0.6.1")
+        p = provider_with_config(
+            prefer_observations=True,
+            recall_min_scores={"reranker": 0.5},
+        )
+        # Despite config being set, both should be knocked out
+        assert p._prefer_observations is False
+        assert p._recall_min_scores is None
+
+        p.handle_tool_call("hindsight_recall", {"query": "test"})
+        kwargs = p._client.arecall.call_args.kwargs
+        assert "prefer_observations" not in kwargs
+        assert "min_scores" not in kwargs
+        assert any("require hindsight-client >= 0.8.4" in rec.message for rec in caplog.records)
