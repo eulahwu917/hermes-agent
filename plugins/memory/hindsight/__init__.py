@@ -263,6 +263,90 @@ def _event_timestamp() -> str:
     if event_time.tzinfo is None or event_time.utcoffset() is None:
         event_time = event_time.astimezone()
     return event_time.isoformat(timespec="seconds")
+def _load_thread_routing() -> dict:
+    """Load the optional thread-scoped recall routing table.
+
+    Same resolution/fail-open discipline as _load_config(): a missing file is a
+    silent no-op (empty table); a malformed file or a bad entry is logged and
+    that entry (or the whole table) is skipped — this must never raise and
+    must never block plugin initialize(). Path is profile-scoped via
+    get_hermes_home(), same as config.json, so multi-profile setups don't
+    collide (Planner review t_a1317d5c, S3).
+
+    Format: {"<platform>:<thread_id>": {"extra_tags": [...], "domain": "...",
+    "vault_path": "..."}}. Only "extra_tags" is consumed by this plugin today;
+    "domain"/"vault_path" are inert here, reserved for future use — a SOUL-level
+    bootstrap-recipe mechanism sharing this table was considered and declined
+    2026-07-24 (Planner consult t_32e5ae5d); these fields stay for whatever else
+    ends up wanting per-thread domain/path metadata.
+    """
+    from pathlib import Path
+
+    routing_path = get_hermes_home() / "hindsight" / "thread_routing.json"
+    if not routing_path.exists():
+        return {}
+    try:
+        raw = json.loads(routing_path.read_text(encoding="utf-8"))
+    except Exception as e:
+        logger.warning("thread_routing.json is malformed, ignoring (fail-open to global recall config): %s", e)
+        return {}
+    if not isinstance(raw, dict):
+        logger.warning("thread_routing.json root is not an object, ignoring: %r", type(raw))
+        return {}
+
+    validated: dict = {}
+    for key, entry in raw.items():
+        try:
+            if not isinstance(key, str) or not isinstance(entry, dict):
+                raise ValueError("entry must be a string key -> object")
+            if entry.get("dormant"):
+                continue  # skip dormant entries — archived threads fall back to global recall config
+            extra_tags = entry.get("extra_tags", [])
+            if extra_tags is None:
+                extra_tags = []
+            if not isinstance(extra_tags, list) or not all(isinstance(t, str) for t in extra_tags):
+                raise ValueError("extra_tags must be a list of strings")
+            validated[key] = {"extra_tags": extra_tags}
+        except Exception as e:
+            logger.warning("thread_routing.json entry %r is invalid, skipping: %s", key, e)
+    return validated
+
+
+def _normalize_retain_tags(value: Any) -> List[str]:
+    """Normalize tag config/tool values to a deduplicated list of strings."""
+    if value is None:
+        return []
+
+    raw_items: list[Any]
+    if isinstance(value, list):
+        raw_items = value
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        if text.startswith("["):
+            try:
+                parsed = json.loads(text)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, list):
+                raw_items = parsed
+            else:
+                raw_items = text.split(",")
+        else:
+            raw_items = text.split(",")
+    else:
+        raw_items = [value]
+
+    normalized = []
+    seen = set()
+    for item in raw_items:
+        tag = str(item).strip()
+        if not tag or tag in seen:
+            continue
+        seen.add(tag)
+        normalized.append(tag)
+    return normalized
 
 
 def _mint_document_id(session_id: str) -> str:
@@ -828,6 +912,29 @@ class HindsightMemoryProvider(MemoryProvider):
         self._recall_prompt_preamble = cfg.get("recall_prompt_preamble", "")
         self._recall_indicator = bool(cfg.get("recall_indicator", True))
 
+        # Thread-scoped recall override (Step 2, Planner review t_a1317d5c).
+        # Must run AFTER the config-based assignment above — and in the new
+        # structure that holds here: initialize() sets _SESSION_KWARGS
+        # (platform/thread_id) before calling this method. Fail-open by
+        # construction: an unmatched key, missing file, or malformed table all
+        # leave self._recall_tags/_recall_tags_match at whatever config.json
+        # already specified — zero behavior change for any unrouted thread.
+        if self._platform and self._thread_id:
+            _routing_key = f"{self._platform}:{self._thread_id}"
+            _routing_table = _load_thread_routing()
+            _routing_entry = _routing_table.get(_routing_key)
+            if _routing_entry is not None:
+                _channel_tag = f"channel:{self._platform}:{self._thread_id}"
+                _override_tags = [_channel_tag] + list(_routing_entry.get("extra_tags", []))
+                self._recall_tags = _override_tags
+                # any_strict, not any (Planner S1) — "any" would also admit
+                # untagged facts, silently weakening the existing config.
+                self._recall_tags_match = "any_strict"
+                logger.info(
+                    "Hindsight thread-routing override active: key=%s recall_tags=%s recall_tags_match=%s",
+                    _routing_key, self._recall_tags, self._recall_tags_match,
+                )
+
     def _start_embedded_daemon(self) -> None:
         """Start the embedded daemon on a background thread (Rich output -> log file)."""
         # PostgreSQL's initdb refuses root; without this guard the start thread
@@ -908,9 +1015,10 @@ class HindsightMemoryProvider(MemoryProvider):
         return resp.results or []
 
     def _reflect(self, query: str) -> str | None:
-        resp = self._run_hindsight_operation(
-            lambda client: client.areflect(bank_id=self._bank_id, query=query, budget=self._budget)
-        )
+        kwargs: dict = {"bank_id": self._bank_id, "query": query, "budget": self._budget}
+        if self._recall_tags:
+            kwargs.update(tags=self._recall_tags, tags_match=self._recall_tags_match)
+        resp = self._run_hindsight_operation(lambda client: client.areflect(**kwargs))
         return resp.text
 
     def _do_recall(self, query: str) -> tuple[str, int]:
@@ -1040,7 +1148,10 @@ class HindsightMemoryProvider(MemoryProvider):
         content = "[" + ",".join(turns) + "]"
         metadata = self._build_metadata(message_count=len(turns) * 2, turn_index=self._turn_index)
         lineage = (("session", self._session_id), ("parent", self._parent_session_id))
-        tags = [f"{kind}:{sid}" for kind, sid in lineage if sid] or None
+        tags = [f"{kind}:{sid}" for kind, sid in lineage if sid]
+        if self._platform and self._thread_id:
+            tags.append(f"channel:{self._platform}:{self._thread_id}")
+        tags = tags or None
         bank_id, retain_async, retain_context = self._bank_id, self._retain_async, self._retain_context
 
         def _job() -> None:
@@ -1127,7 +1238,23 @@ class HindsightMemoryProvider(MemoryProvider):
                      self._bank_id, len(query), self._budget)
         results = self._recall(query)
         logger.debug("Tool hindsight_recall: %d results", len(results))
-        return "\n".join(f"{i}. {r.text}" for i, r in enumerate(results, 1)) or "No relevant memories found."
+        if not results:
+            return "No relevant memories found."
+        lines = []
+        for i, r in enumerate(results, 1):
+            prov_bits = []
+            r_context = getattr(r, "context", None)
+            r_tags = getattr(r, "tags", None)
+            r_type = getattr(r, "type", None)
+            if r_type:
+                prov_bits.append(str(r_type))
+            if r_context:
+                prov_bits.append(str(r_context))
+            if r_tags:
+                prov_bits.append("tags=" + ",".join(r_tags))
+            prov = f" [{'; '.join(prov_bits)}]" if prov_bits else ""
+            lines.append(f"{i}. {r.text}{prov}")
+        return "\n".join(lines)
 
     def _tool_reflect(self, args: dict) -> str:
         query = args["query"]
