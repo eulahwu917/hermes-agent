@@ -16,7 +16,7 @@ _DEFAULT_LOCAL_URL = "http://localhost:8888"
 # Keep in sync with tools/lazy_deps.py ("memory.hindsight") and plugin.yaml.
 # Our pin — upstream still at 0.6.1; keep on rebase (PR #71122 carries 0.8.5 support).
 _MIN_CLIENT_VERSION = "0.8.5"
-_DEFAULT_TIMEOUT = 120  # seconds — cloud API can take 30-40s per request
+_DEFAULT_TIMEOUT = 120  # seconds — cloud API can take 30-40s per request. Override per-profile via timeout key in ~/.hermes/hindsight/config.json
 _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
 # ``metadata.source`` on retained memories is OPT-IN (AGENTS.md forbids
 # on-by-default attribution tags): ``retain_source`` / HINDSIGHT_RETAIN_SOURCE.
