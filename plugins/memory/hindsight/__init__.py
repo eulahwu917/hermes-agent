@@ -1281,7 +1281,15 @@ class HindsightMemoryProvider(MemoryProvider):
             return json.dumps({"result": handler(self, args)})
         except Exception as e:
             logger.warning("%s failed: %s", tool_name, e, exc_info=True)
-            return tool_error(f"{failure}: {e}")
+            # str(TimeoutError()) is empty — prefix the exception type so the
+            # message is never bare (was "Failed to store memory: ").
+            msg = f"{failure}: {type(e).__name__}: {e}"
+            if tool_name == "hindsight_retain" and isinstance(e, TimeoutError):
+                msg += (" The server may have completed the operation despite the "
+                        "client timeout. Do not blindly retry — verify the fact was "
+                        "stored via recall before retrying to avoid duplicates. See "
+                        "hindsight-retain-timeout-workaround.md for REST fallback.")
+            return tool_error(msg)
 
     # -- session lifecycle -------------------------------------------------------
 
