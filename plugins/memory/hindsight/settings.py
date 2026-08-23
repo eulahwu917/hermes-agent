@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import logging
 import re
 from typing import Any, List
@@ -142,6 +143,13 @@ def _normalize_min_scores(value):
         except (TypeError, ValueError):
             logger.warning(
                 "recall_min_scores: key %r has non-numeric value %r — dropping",
+                key_str,
+                raw,
+            )
+            continue
+        if not math.isfinite(v):
+            logger.warning(
+                "recall_min_scores: key %r has non-finite value %r — dropping",
                 key_str,
                 raw,
             )
