@@ -35,6 +35,7 @@ import atexit
 import importlib
 import json
 import logging
+import math
 import os
 import queue
 import sys
@@ -514,6 +515,13 @@ def _normalize_min_scores(value: Any) -> Optional[Dict[str, float]]:
         except (TypeError, ValueError):
             logger.warning(
                 "recall_min_scores: key %r has non-numeric value %r — dropping",
+                key_str,
+                raw,
+            )
+            continue
+        if not math.isfinite(v):
+            logger.warning(
+                "recall_min_scores: key %r has non-finite value %r — dropping",
                 key_str,
                 raw,
             )
