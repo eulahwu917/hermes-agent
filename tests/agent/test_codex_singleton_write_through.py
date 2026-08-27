@@ -1050,6 +1050,15 @@ def test_t18_dual_enumeration_budget_pin():
         "CHANGELOG.md",
         "tests/agent/test_codex_singleton_write_through.py",
     }
+    # Multi-patch deployments (e.g. LOCAL_PATCHES.md carriers): files carried by
+    # OTHER, unrelated patches must be declared via HERMES_T18_EXTRA_NONPROD
+    # (comma-separated paths) so this pin stays byte-exact for the OAuth patch
+    # itself while tolerating sibling patches. Unset => upstream-strict mode.
+    extra = {
+        p.strip() for p in
+        os.environ.get("HERMES_T18_EXTRA_NONPROD", "").split(",") if p.strip()
+    }
+    allowed_nonprod |= extra
     nonprod = {f for f in changed if f != "hermes_cli/auth.py"}
     assert nonprod == allowed_nonprod, (
         f"non-production files must EXACTLY equal {sorted(allowed_nonprod)}; got {sorted(nonprod)}"
