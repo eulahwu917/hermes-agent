@@ -18,9 +18,12 @@ The tests drive the real read-modify-write path against on-disk stores under
 
 import base64
 import json
+import logging
 import re
 import subprocess
 import threading
+
+from contextlib import contextmanager
 
 import pytest
 
@@ -86,6 +89,16 @@ def _reset_rescue_state(monkeypatch):
     A._global_auth_store_cache = None
 
 
+@pytest.fixture
+def top_level_store(tmp_path, monkeypatch):
+    """Top-level mode: the active store IS the global root (one shared file)."""
+    root_path = tmp_path / "root" / "auth.json"
+    monkeypatch.setattr(A, "_auth_file_path", lambda: root_path)
+    monkeypatch.setattr(A, "_global_auth_file_path", lambda: root_path)
+    monkeypatch.setenv("HOME", str(tmp_path / "not-the-root"))
+    return root_path
+
+
 def _mock_refresh(monkeypatch, result=None, exc=None, calls=None):
     """Replace ``refresh_codex_oauth_pure`` with a scripted stub."""
     def fake(access_token, refresh_token, timeout_seconds=20.0, **kw):
@@ -125,6 +138,29 @@ def test_t1_root_resolved_success_writes_root_zero_profile(profile_and_root, mon
     assert "openai-codex" not in profile.get("providers", {}), (
         "a root-resolved reader must NOT seed a shadowing profile block (#74339)"
     )
+
+
+def test_t1_top_level_root_silent_success(top_level_store, monkeypatch, caplog):
+    """F1: when root == active store (top-level mode), the rotation persists
+    directly to that store as OUTCOME-SUCCESS — silent, zero CRITICAL."""
+    root_path = top_level_store
+    _write_store(root_path, {"version": 1, "providers": {"openai-codex": _codex_state(
+        {"access_token": _jwt("acct-1"), "refresh_token": "root-rf"})}})
+
+    _mock_refresh(monkeypatch, result={"access_token": _jwt("acct-1"), "refresh_token": "new-rf"})
+
+    with caplog.at_level("DEBUG"):
+        out = _refresh_codex_auth_tokens(
+            {"access_token": _jwt("acct-1"), "refresh_token": "stale-rf"}, 20.0)
+
+    assert out["refresh_token"] == "new-rf"
+
+    # The rotated chain IS durably written to the (root == active) store.
+    rt = _read_store(root_path)["providers"]["openai-codex"]["tokens"]["refresh_token"]
+    assert rt == "new-rf", "top-level rotation was lost (same-path no-op)"
+
+    # OUTCOME-SUCCESS is silent: no WARNING and no CRITICAL.
+    assert not any(r.levelno >= logging.WARNING for r in caplog.records), caplog.text
 
 
 def test_t2_owned_success_syncs_root_and_preserves_independent(profile_and_root, monkeypatch):
@@ -210,8 +246,11 @@ def test_t4_switch_matrix(profile_and_root, monkeypatch, same_sub):
 
 # ── T5 — the fault matrix (SILENT / CLASS-D / CLASS-N) ──────────────────────
 
-def test_t5_c1_root_failure_profile_intact_warning(profile_and_root, monkeypatch):
-    """CLASS-D: a root write-through failure leaves the profile save intact."""
+def test_t5_c1_root_failure_profile_intact_warning(profile_and_root, monkeypatch, caplog):
+    """CLASS-D: a root write-through failure leaves the profile save intact.
+
+    Contract: the failure logs WARNING (self-healing next-trigger resync), and
+    the profile copy stays durably intact."""
     profile_path, root_path = profile_and_root
     _write_store(root_path, {"version": 1, "providers": {"openai-codex": _codex_state(
         {"access_token": _jwt("acct-1"), "refresh_token": "root-rf"}
@@ -220,10 +259,16 @@ def test_t5_c1_root_failure_profile_intact_warning(profile_and_root, monkeypatch
 
     monkeypatch.setattr(A, "_save_auth_store", _failing_save(A._save_auth_store, root_path=root_path))
 
-    _save_codex_tokens({"access_token": _jwt("acct-1"), "refresh_token": "new-rf"})
+    with caplog.at_level("DEBUG"):
+        _save_codex_tokens({"access_token": _jwt("acct-1"), "refresh_token": "new-rf"})
 
     profile = _read_store(profile_path)
     assert profile["providers"]["openai-codex"]["tokens"]["refresh_token"] == "new-rf"
+
+    # CLASS-D = WARNING only; no CRITICAL (the profile copy is the durable store).
+    warns = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert warns, "CLASS-D must emit a WARNING (self-healing root resync)"
+    assert not any(r.levelno >= logging.CRITICAL for r in caplog.records), caplog.text
 
 
 def _failing_save(original_save, root_path):
@@ -235,8 +280,18 @@ def _failing_save(original_save, root_path):
     return wrapped
 
 
-def test_t5_c2_direct_root_failure_returns_tokens_critical(profile_and_root, monkeypatch):
-    """CLASS-N: a root-resolved direct write that always fails still returns tokens."""
+def _fake_timer(monkeypatch):
+    """Replace ``time.sleep`` with a recorder; returns the ordered delay list."""
+    sleeps = []
+    monkeypatch.setattr(A.time, "sleep", sleeps.append)
+    return sleeps
+
+
+def test_t5_c2_direct_root_failure_returns_tokens_critical(profile_and_root, monkeypatch, caplog):
+    """CLASS-N: a root-resolved direct write that always fails still returns tokens.
+
+    Contract: exactly 3 attempts, fixed backoffs [0.5s, 1.0s], then CRITICAL
+    naming manual ``hermes model`` re-auth (refreshed tokens still returned)."""
     profile_path, root_path = profile_and_root
     _write_store(root_path, {"version": 1, "providers": {"openai-codex": _codex_state(
         {"access_token": _jwt("acct-1"), "refresh_token": "root-rf"}
@@ -253,16 +308,25 @@ def test_t5_c2_direct_root_failure_returns_tokens_critical(profile_and_root, mon
         return False  # always fails
 
     monkeypatch.setattr(A, "_write_through_codex_to_global_root", fake_write_through)
+    sleeps = _fake_timer(monkeypatch)
 
     tokens = {"access_token": _jwt("acct-1"), "refresh_token": "stale-rf"}
-    out = _refresh_codex_auth_tokens(tokens, 20.0)
+    with caplog.at_level("DEBUG"):
+        out = _refresh_codex_auth_tokens(tokens, 20.0)
 
     assert out["refresh_token"] == "new-rf"  # tokens still returned
     assert len(results) == _CODEX_ROOT_PERSIST_ATTEMPTS  # exactly 3 attempts
+    # fixed backoff ordering, index-aligned with the attempts that precede them
+    assert sleeps == list(_CODEX_ROOT_PERSIST_BACKOFF_SECONDS), sleeps
+
+    crits = [r for r in caplog.records if r.levelno >= logging.CRITICAL]
+    assert crits, "CLASS-N must emit a CRITICAL after exhausting retries"
+    assert any("hermes model" in r.getMessage() for r in crits), "CRITICAL must name manual re-auth"
 
 
-def test_t5_c3_post_persist_failure_returns_tokens_no_autherror(profile_and_root, monkeypatch):
-    """CLASS-N: after a successful rescue POST, persistence failure must not raise."""
+def test_t5_c3_post_persist_failure_returns_tokens_no_autherror(profile_and_root, monkeypatch, caplog):
+    """CLASS-N (root-resolved rescue): persistence failure after a successful
+    adoption POST still returns tokens — 3 attempts, 2 backoffs, then CRITICAL."""
     profile_path, root_path = profile_and_root
     _write_store(root_path, {"version": 1, "providers": {"openai-codex": _codex_state(
         {"access_token": _jwt("acct-1"), "refresh_token": "fresher-rf"}
@@ -283,12 +347,62 @@ def test_t5_c3_post_persist_failure_returns_tokens_no_autherror(profile_and_root
     # Persistence always fails → CLASS-N (must still return tokens, not raise).
     monkeypatch.setattr(A, "_save_auth_store", _failing_save(A._save_auth_store, root_path=root_path))
     monkeypatch.setattr(A, "_write_through_codex_to_global_root", lambda *a, **k: False)
+    sleeps = _fake_timer(monkeypatch)
 
     tokens = {"access_token": _jwt("acct-1"), "refresh_token": "stale-rf"}
-    out = _refresh_codex_auth_tokens(tokens, 20.0)
+    with caplog.at_level("DEBUG"):
+        out = _refresh_codex_auth_tokens(tokens, 20.0)
 
     assert out["refresh_token"] == "adopted-rf"
     assert state["n"] == 1  # one adoption POST ran
+    assert sleeps == list(_CODEX_ROOT_PERSIST_BACKOFF_SECONDS), sleeps
+
+    crits = [r for r in caplog.records if r.levelno >= logging.CRITICAL]
+    assert crits, "CLASS-N rescue persistence failure must CRITICAL"
+    assert any("hermes model" in r.getMessage() for r in crits)
+
+
+def test_t5_c3_owned_local_save_failure_critical_retries(profile_and_root, monkeypatch, caplog):
+    """F2/C3-owned CLASS-N: a local save failure after a successful rescue POST
+    retries 3× with 2 backoffs BEFORE CRITICAL (mirrors the C2 CLASS-N loop)."""
+    profile_path, root_path = profile_and_root
+    _write_store(root_path, {"version": 1, "providers": {"openai-codex": _codex_state(
+        {"access_token": _jwt("acct-1"), "refresh_token": "fresher-rf"}
+    )}})
+    # OWNED caller: the profile holds its own (stale) codex block.
+    _write_store(profile_path, {"version": 1, "providers": {"openai-codex": _codex_state(
+        {"access_token": _jwt("acct-1"), "refresh_token": "stale-rf"}
+    )}})
+
+    def fake(access_token, refresh_token, timeout_seconds=20.0, **kw):
+        if refresh_token == "stale-rf":
+            raise AuthError("rejected", provider="openai-codex",
+                            code="invalid_grant", relogin_required=True)
+        return {"access_token": _jwt("acct-1"), "refresh_token": "adopted-rf"}
+
+    monkeypatch.setattr(A, "refresh_codex_oauth_pure", fake)
+
+    save_attempts = []
+
+    def failing_local_save(tokens, last_refresh=None, label=None):
+        save_attempts.append(tokens.get("refresh_token"))
+        raise OSError("simulated local-save failure")
+
+    monkeypatch.setattr(A, "_save_codex_tokens", failing_local_save)
+    sleeps = _fake_timer(monkeypatch)
+
+    tokens = {"access_token": _jwt("acct-1"), "refresh_token": "stale-rf"}
+    with caplog.at_level("DEBUG"):
+        out = _refresh_codex_auth_tokens(tokens, 20.0)
+
+    # Refreshed/adopted tokens are still handed back (loud, not silent).
+    assert out["refresh_token"] == "adopted-rf"
+    # exactly 3 total local-save attempts, 2 fixed backoffs, then CRITICAL
+    assert len(save_attempts) == _CODEX_ROOT_PERSIST_ATTEMPTS, save_attempts
+    assert sleeps == list(_CODEX_ROOT_PERSIST_BACKOFF_SECONDS), sleeps
+    crits = [r for r in caplog.records if r.levelno >= logging.CRITICAL]
+    assert crits, "C3-owned CLASS-N must CRITICAL after retries"
+    assert any("hermes model" in r.getMessage() for r in crits)
 
 
 def test_t5_silent_success_no_warning_no_critical(profile_and_root, monkeypatch, caplog):
@@ -330,6 +444,52 @@ def test_t6_classic_mode_inert(profile_and_root, monkeypatch, tmp_path):
 
     store = _read_store(root_path)
     assert store["providers"]["openai-codex"]["tokens"]["refresh_token"] == "new-rf"
+
+
+def test_t6_classic_mode_byte_identity(profile_and_root, monkeypatch):
+    """D-classic: classic-mode persistence is byte-identical to merge-base.
+
+    With no global root, the write-through feature must not perturb any
+    non-codex byte of the store, and the codex block holds exactly the rotated
+    chain — i.e. the same bytes a pre-feature save would have produced."""
+    profile_path, root_path = profile_and_root
+    monkeypatch.setattr(A, "_global_auth_file_path", lambda: None)
+    monkeypatch.setattr(A, "_auth_file_path", lambda: root_path)
+
+    baseline = {
+        "version": A.AUTH_STORE_VERSION,
+        "active_provider": "anthropic",
+        "providers": {
+            "anthropic": {"tokens": {"access_token": "ak-ant"}, "auth_mode": "chatgpt"},
+        },
+        "credential_pool": {
+            "anthropic": [{"id": "a", "source": "manual", "access_token": "ak-ant", "label": "l"}],
+        },
+        "nested": {"key": "value", "list": [1, 2, 3]},
+    }
+    _write_store(root_path, baseline)
+    _mock_refresh(monkeypatch, result={"access_token": _jwt("acct-1"), "refresh_token": "new-rf"})
+
+    # function outcome: classic-mode refresh returns the rotated chain
+    out = _refresh_codex_auth_tokens(
+        {"access_token": _jwt("acct-1"), "refresh_token": "r1"}, 20.0)
+    assert out == {"access_token": _jwt("acct-1"), "refresh_token": "new-rf"}
+
+    store = _read_store(root_path)
+
+    # every non-codex byte is identical to the baseline snapshot — the
+    # write-through feature added nothing in classic (no-global-root) mode.
+    assert store["version"] == baseline["version"]
+    assert store["nested"] == baseline["nested"]
+    assert store["providers"]["anthropic"] == baseline["providers"]["anthropic"]
+    assert store["credential_pool"]["anthropic"] == baseline["credential_pool"]["anthropic"]
+
+    # the only codex-adjacent mutations are the expected merge-base ones:
+    # active_provider flips to openai-codex and the codex block holds the chain.
+    assert store["active_provider"] == "openai-codex"
+    codex = store["providers"]["openai-codex"]
+    assert codex["tokens"]["access_token"] == _jwt("acct-1")
+    assert codex["tokens"]["refresh_token"] == "new-rf"
 
 
 # ── T7 — rescue-order matrix + repeat/cap ───────────────────────────────────
@@ -443,10 +603,14 @@ def test_t7_repeat_tuple_skip_and_ineligible_no_consume(profile_and_root, monkey
 def test_t7c_two_threads_single_adoption(profile_and_root, monkeypatch):
     """Two same-process threads, same dead tuple ⇒ exactly one adoption POST.
 
-    The seen-set is checked-and-marked atomically INSIDE the root flock, so
-    the two contention attempts serialize: the loser observes the winner's mark
-    inside its acquired critical section and falls through to CLI recovery. A
-    defective outside-lock-decides implementation would double-POST here.
+    AMENDMENT-T7cv10: deterministic double-barrier choreography. B1 aligns the
+    threads pre-race; each records its instrumented candidate seen-set
+    observation BEFORE any lock acquisition; B2 releases only after BOTH
+    pre-check observations are recorded; only then do they contend the flock.
+    The authoritative re-check+mark happens INSIDE the acquired critical
+    section — the loser observes the winner's mark there and falls through to
+    CLI recovery. A defective outside-lock-decides implementation would
+    double-POST and fail under this schedule.
     """
     profile_path, root_path = profile_and_root
     _write_store(root_path, {"version": 1, "providers": {"openai-codex": _codex_state(
@@ -454,8 +618,12 @@ def test_t7c_two_threads_single_adoption(profile_and_root, monkeypatch):
     )}})
     _write_store(profile_path, {"version": 1})
 
+    DEAD = (_jwt("acct-1"), "stale-rf")
     posts = []
     lock = threading.Lock()
+    b1 = threading.Barrier(2)
+    b2 = threading.Barrier(2)
+    obs = []  # (phase, thread_name, dead_tuple_in_seen)
 
     def fake(access_token, refresh_token, timeout_seconds=20.0, **kw):
         if refresh_token == "stale-rf":
@@ -469,12 +637,41 @@ def test_t7c_two_threads_single_adoption(profile_and_root, monkeypatch):
     monkeypatch.setattr(A, "_recover_codex_tokens_from_cli",
                         lambda *a, **k: {"access_token": "cli-at", "refresh_token": "cli-rf"})
 
+    real_lock = A._auth_store_lock
+    tl = threading.local()
+
+    @contextmanager
+    def instrumented_lock(timeout_seconds=A.AUTH_LOCK_TIMEOUT_SECONDS, *, target_path=None):
+        if target_path is not None and A._same_path(target_path, root_path):
+            depth = getattr(tl, "depth", 0)
+            outer = depth == 0
+            if outer:
+                # instrumented candidate seen-set check BEFORE any lock acquisition
+                obs.append(("pre", threading.current_thread().name, DEAD in A._codex_root_rescue_seen))
+                b2.wait(timeout=30)
+            tl.depth = depth + 1
+            try:
+                with real_lock(timeout_seconds, target_path=target_path):
+                    if outer:
+                        # authoritative in-lock observation (the only copy that decides)
+                        obs.append(("inlock", threading.current_thread().name,
+                                    DEAD in A._codex_root_rescue_seen))
+                    yield
+            finally:
+                tl.depth = getattr(tl, "depth", 1) - 1
+        else:
+            with real_lock(timeout_seconds, target_path=target_path):
+                yield
+
+    monkeypatch.setattr(A, "_auth_store_lock", instrumented_lock)
+
     rescued = []
     recovered = []
     errors = []
 
     def worker():
         try:
+            b1.wait(timeout=30)
             out = A._refresh_codex_auth_tokens(
                 {"access_token": _jwt("acct-1"), "refresh_token": "stale-rf"}, 20.0)
         except AuthError as exc:  # noqa: BLE001
@@ -489,10 +686,22 @@ def test_t7c_two_threads_single_adoption(profile_and_root, monkeypatch):
     for t in threads:
         t.start()
     for t in threads:
-        t.join(timeout=20)
+        t.join(timeout=30)
 
     assert not errors, errors
     assert all(not t.is_alive() for t in threads)
+
+    pre = [o for o in obs if o[0] == "pre"]
+    inlock = [o for o in obs if o[0] == "inlock"]
+    # both threads recorded their outside-lock pre-check before any lock was taken
+    assert len(pre) == 2, f"expected both pre-check observations; got {obs}"
+    assert all(not o[2] for o in pre), "outside-lock pre-checks must both see the tuple unmarked"
+    # exactly one winner (in-lock sees unmarked) and one loser (in-lock sees the mark)
+    winners = [o for o in inlock if not o[2]]
+    losers = [o for o in inlock if o[2]]
+    assert len(winners) == 1, f"expected one in-lock winner; got {inlock}"
+    assert len(losers) == 1, "the loser's authoritative in-lock observation must see the winner's mark"
+
     assert len(posts) == 1, "exactly ONE adoption POST globally"
     assert len(rescued) == 1, "exactly one thread self-healed via rescue"
     assert len(recovered) == 1, "the loser fell through to CLI recovery"
@@ -552,7 +761,11 @@ def test_t9_concurrency_honest_invariants(profile_and_root, monkeypatch):
         return {"access_token": _jwt("acct-1"), "refresh_token": "adopted-rf"}
 
     monkeypatch.setattr(A, "refresh_codex_oauth_pure", fake)
-    monkeypatch.setattr(A, "_recover_codex_tokens_from_cli", lambda *a, **k: None)
+    # P0/P1/P2: root chain is the same account; only cohort members write; the
+    # CLI recovery path also yields a valid chain, so every loser self-heals —
+    # ZERO relogin surfaces.
+    monkeypatch.setattr(A, "_recover_codex_tokens_from_cli",
+                        lambda *a, **k: {"access_token": "cli-at", "refresh_token": "cli-rf"})
 
     n = 3
     held = []
@@ -576,14 +789,13 @@ def test_t9_concurrency_honest_invariants(profile_and_root, monkeypatch):
     for t in threads:
         t.join(timeout=20)
 
-    # (a) at least one participant holds a valid rotated chain (the winner)
-    assert held, "at least one thread must self-heal and hold the rotated chain"
-    assert all(h.get("refresh_token") == "adopted-rf" for h in held)
-    # every surfaced failure is an AuthError (the losers fall through to CLI
-    # recovery and re-raise only because that path is empty here)
-    assert len(errors) + len(held) == n
-    # (c) per-chain adoption POST bound ≤ racing processes (seen-set ⇒ exactly 1)
-    assert 1 <= len(posts) <= n
+    # (b)/(c) under P0∧P1∧P2: every participant self-heals — ZERO surfaced
+    # AuthErrors/relogin across all threads.
+    assert not errors, f"no relogin should surface under P0/P1/P2; got {errors}"
+    assert len(held) == n, f"every thread must hold a chain; got {len(held)} held"
+    assert all(h.get("refresh_token") for h in held)
+    # per-chain adoption POST bound (seen-set ⇒ exactly 1 across the cohort)
+    assert len(posts) == 1, f"exactly one adoption POST; got {len(posts)}"
     # final root holds a valid rotated chain
     root_store = _read_store(root_path)
     rt = root_store["providers"]["openai-codex"]["tokens"]["refresh_token"]
@@ -601,6 +813,38 @@ def test_t13_identity_corner_matrix():
     assert _codex_token_identity(_jwt("")) is None  # empty sub
     assert _codex_token_identity("opaque-token") is None  # not a JWT
     assert _codex_token_identity(None) is None  # not a str
+    # missing-iss ⇒ None-conservative (no issuer claim ⇒ cannot establish identity)
+    tok_no_iss = ".".join([_b64({"alg": "none", "typ": "JWT"}), _b64({"sub": "acct-1"}), "sig"])
+    assert _codex_token_identity(tok_no_iss) is None
+
+
+def test_t13_both_none_pair_store_matrix(profile_and_root, monkeypatch):
+    """D-id both-None: an opaque token on BOTH sides refuses the cross-store write
+    (root + aliases untouched); an empty root is still populated."""
+    profile_path, root_path = profile_and_root
+    opaque = "opaque-token"  # not a JWT → identity None (conservative skip)
+
+    # (a) non-empty root with opaque credentials → both identities None ⇒ the
+    # D-id gate refuses: root singleton and its alias are left byte-identical.
+    _write_store(root_path, {"version": 1, "providers": {"openai-codex": _codex_state(
+        {"access_token": "opaque-root", "refresh_token": "root-rf"}
+    )}, "credential_pool": {"openai-codex": [
+        {"id": "alias", "source": "manual:device_code", "access_token": "opaque-root",
+         "refresh_token": "root-rf", "label": "lbl"},
+    ]}})
+    _write_store(profile_path, {"version": 1})
+    _save_codex_tokens({"access_token": opaque, "refresh_token": "new-rf"})
+
+    root_store = _read_store(root_path)
+    assert root_store["providers"]["openai-codex"]["tokens"]["refresh_token"] == "root-rf"  # untouched
+    assert root_store["credential_pool"]["openai-codex"][0]["refresh_token"] == "root-rf"  # aliases skip
+
+    # (b) empty root → populated (no credentials ⇒ identity gate skipped).
+    _write_store(root_path, {"version": 1, "active_provider": "anthropic", "providers": {}})
+    _save_codex_tokens({"access_token": opaque, "refresh_token": "new-rf"})
+    root_store = _read_store(root_path)
+    assert root_store["providers"]["openai-codex"]["tokens"]["refresh_token"] == "new-rf"  # empty-root populated
+    assert root_store["active_provider"] == "anthropic"  # set_active untouched
 
 
 def test_t10_structure_preservation(profile_and_root, monkeypatch):
@@ -641,6 +885,28 @@ def test_t17_field_set_pin(profile_and_root, monkeypatch):
     assert rc["auth_mode"] == "chatgpt"
     assert rc["last_refresh"]  # present
     assert rc["custom_field"] == "keep"  # root-only field preserved
+
+
+def test_t17_label_rule(profile_and_root, monkeypatch):
+    """Label rule: a non-empty label is written through; absent/empty is not
+    (a pre-existing label is preserved rather than cleared)."""
+    profile_path, root_path = profile_and_root
+    _write_store(root_path, {"version": 1, "providers": {"openai-codex": _codex_state(
+        {"access_token": _jwt("acct-1"), "refresh_token": "root-rf"}
+    )}})
+    _write_store(profile_path, {"version": 1})
+
+    # non-empty label present → written to the root (and profile)
+    _save_codex_tokens({"access_token": _jwt("acct-1"), "refresh_token": "r1"},
+                       last_refresh="2026-06-01T00:00:00Z", label="My Codex")
+    rc = _read_store(root_path)["providers"]["openai-codex"]
+    assert rc["label"] == "My Codex"
+
+    # absent/empty (whitespace) label → NOT written; prior label preserved
+    _save_codex_tokens({"access_token": _jwt("acct-1"), "refresh_token": "r2"},
+                       last_refresh="2026-06-02T00:00:00Z", label="   ")
+    rc = _read_store(root_path)["providers"]["openai-codex"]
+    assert rc["label"] == "My Codex"  # whitespace label is not a label
 
 
 # ── T15 / T18 — negative greps + dual-enumeration budget pin ────────────────
@@ -696,34 +962,59 @@ def test_t15_negative_greps():
 
 
 def test_t18_dual_enumeration_budget_pin():
-    """R17′/T18: production symbol + non-production file budget (vs merge-base)."""
+    """R17′prod/§SB: EXACT production-symbol + non-production-file budgets."""
     changed = _changed_files()
 
     allowed_nonprod = {
         "CHANGELOG.md",
         "tests/agent/test_codex_singleton_write_through.py",
-        "tests/agent/test_credential_pool_oauth_writethrough.py",
     }
-    nonprod = {f for f in changed if f != "hermes_cli/auth.py" and not f.endswith("auth.py")}
-    assert nonprod <= allowed_nonprod, f"unexpected non-production files: {nonprod - allowed_nonprod}"
-    assert len(nonprod) <= 3, f"non-production budget ≤3, got {len(nonprod)}: {nonprod}"
+    nonprod = {f for f in changed if f != "hermes_cli/auth.py"}
+    assert nonprod == allowed_nonprod, (
+        f"non-production files must EXACTLY equal {sorted(allowed_nonprod)}; got {sorted(nonprod)}"
+    )
 
     diff = _auth_diff_text()
-    funcs = set(re.findall(r"(?m)^\+def\s+([A-Za-z_]\w*)\s*\(", diff))
-    vars_ = set(re.findall(r"(?m)^\+([A-Za-z_][A-Za-z0-9_]*)\s*[:=]", diff))
 
-    allowed_funcs = {
-        "_save_codex_tokens",
-        "_refresh_codex_auth_tokens",
+    # §SB amended symbol budget (exact-equality, NOT subset). The diff
+    # INTRODUCES exactly three helpers and four module-data symbols, and REMOVES
+    # nothing. The two host functions (_save_codex_tokens / _refresh_codex_auth_tokens)
+    # are MODIFIED in place: their `def` lines predate this change, so they appear
+    # in neither the added- nor removed-symbol sets and are asserted separately
+    # via the hunk-scope check below.
+    added_funcs = set(re.findall(r"(?m)^\+def\s+([A-Za-z_]\w*)\s*\(", diff))
+    removed_funcs = set(re.findall(r"(?m)^-def\s+([A-Za-z_]\w*)\s*\(", diff))
+    added_data = set(re.findall(r"(?m)^\+([A-Za-z_][A-Za-z0-9_]*)\s*[:=]", diff))
+    removed_data = set(re.findall(r"(?m)^-([A-Za-z_][A-Za-z0-9_]*)\s*[:=]", diff))
+
+    expected_helpers = {
         "_codex_token_identity",
         "_write_through_codex_to_global_root",
         "_reset_codex_root_rescue_seen",
     }
-    allowed_vars = {
+    expected_data = {
         "_CODEX_OAUTH_ISSUER",
         "_CODEX_ROOT_PERSIST_ATTEMPTS",
         "_CODEX_ROOT_PERSIST_BACKOFF_SECONDS",
         "_codex_root_rescue_seen",
     }
-    assert funcs <= allowed_funcs, f"unexpected added/modified functions: {funcs - allowed_funcs}"
-    assert vars_ <= allowed_vars, f"unexpected added module data: {vars_ - allowed_vars}"
+    assert added_funcs == expected_helpers, (
+        f"introduced-function budget {sorted(expected_helpers)} != {sorted(added_funcs)}"
+    )
+    assert added_data == expected_data, (
+        f"introduced-data budget {sorted(expected_data)} != {sorted(added_data)}"
+    )
+    assert removed_funcs == set(), f"no function may be removed: {removed_funcs}"
+    assert removed_data == set(), f"no module data may be removed: {removed_data}"
+
+    # The two host functions must be the ONLY modified functions. The helper
+    # block lands in the diff hunk header of the following `_sync_codex_pool_entries`
+    # (insertion context, not a symbol this change authored).
+    modified = set(re.findall(r"(?m)^@@.*?\bdef\s+([A-Za-z_]\w*)\s*\(", diff))
+    expected_modified = {"_save_codex_tokens", "_refresh_codex_auth_tokens"}
+    assert expected_modified <= modified, (
+        f"host functions must be modified; hunk scope was {modified}"
+    )
+    assert modified <= ({"_sync_codex_pool_entries"} | expected_modified), (
+        f"unexpected modified-function scope: {modified}"
+    )
