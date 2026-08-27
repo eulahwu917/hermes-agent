@@ -19,6 +19,7 @@ The tests drive the real read-modify-write path against on-disk stores under
 import base64
 import json
 import logging
+import os
 import re
 import subprocess
 import threading
@@ -349,12 +350,31 @@ def test_t5_c3_post_persist_failure_returns_tokens_no_autherror(profile_and_root
     monkeypatch.setattr(A, "_write_through_codex_to_global_root", lambda *a, **k: False)
     sleeps = _fake_timer(monkeypatch)
 
+    # COUNT persistence attempts: every CLASS-N row must run the full
+    # 3-attempt ladder against the failing root persist, with the two
+    # intervening backoffs in contract order.
+    wt_calls = []
+    real_wt = A._write_through_codex_to_global_root
+
+    def counting_wt(*a, **k):
+        wt_calls.append(1)
+        return False
+
+    monkeypatch.setattr(A, "_write_through_codex_to_global_root", counting_wt)
+
     tokens = {"access_token": _jwt("acct-1"), "refresh_token": "stale-rf"}
     with caplog.at_level("DEBUG"):
         out = _refresh_codex_auth_tokens(tokens, 20.0)
 
     assert out["refresh_token"] == "adopted-rf"
     assert state["n"] == 1  # one adoption POST ran
+    # R16'/A1v10 contract: the persistence ladder runs the FULL attempt count
+    # (== _CODEX_ROOT_PERSIST_ATTEMPTS) against the failing root persist —
+    # asserting sleeps alone would allow a single-attempt implementation.
+    assert len(wt_calls) == A._CODEX_ROOT_PERSIST_ATTEMPTS, (
+        f"expected {A._CODEX_ROOT_PERSIST_ATTEMPTS} root-RMW attempts, saw {len(wt_calls)}"
+    )
+    assert len(sleeps) == A._CODEX_ROOT_PERSIST_ATTEMPTS - 1, sleeps
     assert sleeps == list(_CODEX_ROOT_PERSIST_BACKOFF_SECONDS), sleeps
 
     crits = [r for r in caplog.records if r.levelno >= logging.CRITICAL]
@@ -468,6 +488,7 @@ def test_t6_classic_mode_byte_identity(profile_and_root, monkeypatch):
         "nested": {"key": "value", "list": [1, 2, 3]},
     }
     _write_store(root_path, baseline)
+    _t6_pre = _read_store(root_path)
     _mock_refresh(monkeypatch, result={"access_token": _jwt("acct-1"), "refresh_token": "new-rf"})
 
     # function outcome: classic-mode refresh returns the rotated chain
@@ -477,12 +498,29 @@ def test_t6_classic_mode_byte_identity(profile_and_root, monkeypatch):
 
     store = _read_store(root_path)
 
-    # every non-codex byte is identical to the baseline snapshot — the
-    # write-through feature added nothing in classic (no-global-root) mode.
-    assert store["version"] == baseline["version"]
-    assert store["nested"] == baseline["nested"]
-    assert store["providers"]["anthropic"] == baseline["providers"]["anthropic"]
-    assert store["credential_pool"]["anthropic"] == baseline["credential_pool"]["anthropic"]
+    # byte-identity vs the PRE-FUNCTION on-disk snapshot: the classic-mode
+    # (no-global-root) save must produce exactly the merge-base bytes — i.e.
+    # compare against what an UNCHANGED baseline module would have written,
+    # not merely selected fields. Non-codex subtrees must be untouched AND
+    # structural formatting/order preserved, so we diff raw objects.
+    pre = _t6_pre
+    # `updated_at` is stamped by _save_auth_store at EVERY save (merge-base
+    # L1431 behavior, unchanged) — it is the one legitimate post-save addition.
+    assert set(store.keys()) - set(pre.keys()) == {"updated_at"}, "top-level key drift in classic mode"
+    assert store["version"] == pre["version"]
+    assert store["nested"] == pre["nested"]
+    assert store["active_provider"] == "openai-codex"  # expected codex-adjacent mutation
+    assert store["providers"]["anthropic"] == pre["providers"]["anthropic"]
+    assert store["credential_pool"]["anthropic"] == pre["credential_pool"]["anthropic"]
+    # providers/credential_pool gained ONLY the openai-codex key, nothing else:
+    assert set(store["providers"].keys()) - set(pre["providers"].keys()) == {"openai-codex"}
+    assert set(pre["providers"].keys()) - set(store["providers"].keys()) == set()
+    assert set(store["credential_pool"].keys()) == set(pre["credential_pool"].keys())
+    # the codex block itself must equal exactly what merge-base logic writes:
+    # tokens + auth_mode="chatgpt" (+ label rule), no write-through extras.
+    codex_block = store["providers"]["openai-codex"]
+    assert set(codex_block.keys()) <= {"tokens", "last_refresh", "auth_mode", "label"}
+    assert "write_through" not in json.dumps(store)
 
     # the only codex-adjacent mutations are the expected merge-base ones:
     # active_provider flips to openai-codex and the codex block holds the chain.
@@ -917,6 +955,11 @@ def _git(*args):
     return subprocess.run(["git", "-C", root, *args], capture_output=True, text=True)
 
 
+def _git_repo_root() -> str:
+    return subprocess.run(["git", "rev-parse", "--show-toplevel"],
+                          capture_output=True, text=True).stdout.strip()
+
+
 def _diff_base():
     # The branch descends from upstream commit 77001a6be; upstream/main has
     # since advanced, so resolve the true fork point via merge-base rather than
@@ -961,8 +1004,46 @@ def test_t15_negative_greps():
     assert "id_token" not in diff
 
 
+def _ast_top_level_symbols(source_text: str) -> dict:
+    """Map every top-level symbol name -> stable AST dump of its definition."""
+    import ast as _ast
+    tree = _ast.parse(source_text)
+    out = {}
+    for node in tree.body:
+        if isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef, _ast.ClassDef)):
+            out[node.name] = _ast.dump(node)
+        elif isinstance(node, _ast.Assign):
+            for t in node.targets:
+                if isinstance(t, _ast.Name):
+                    out[t.id] = _ast.dump(node)
+        elif isinstance(node, _ast.AnnAssign) and isinstance(node.target, _ast.Name):
+            out[node.target.id] = _ast.dump(node)
+    return out
+
+
+def _auth_symbol_maps():
+    """{merge_base: symbols, worktree_HEAD: symbols} for hermes_cli/auth.py."""
+    import ast as _ast
+    base_sha = _diff_base()
+    base_text = _git("show", f"{base_sha}:hermes_cli/auth.py").stdout
+    head_path = os.path.join(_git_repo_root(), "hermes_cli", "auth.py")
+    with open(head_path) as fh:
+        head_text = fh.read()
+    return (
+        _ast_top_level_symbols(base_text),
+        _ast_top_level_symbols(head_text),
+    )
+
+
 def test_t18_dual_enumeration_budget_pin():
-    """R17′prod/§SB: EXACT production-symbol + non-production-file budgets."""
+    """R17'prod/§SB: EXACT production-symbol + non-production-file budgets.
+
+    Structural, not heuristic: parse BOTH versions of hermes_cli/auth.py with
+    ``ast`` and compare their top-level symbol trees exactly. Any added,
+    removed, or modified production symbol outside the §SB enumeration fails —
+    including symbol kinds regex-on-diff hunks would miss (classes, imports,
+    ann-assigns, mid-file inserts).
+    """
     changed = _changed_files()
 
     allowed_nonprod = {
@@ -974,47 +1055,34 @@ def test_t18_dual_enumeration_budget_pin():
         f"non-production files must EXACTLY equal {sorted(allowed_nonprod)}; got {sorted(nonprod)}"
     )
 
-    diff = _auth_diff_text()
+    base_syms, head_syms = _auth_symbol_maps()
+    added = set(head_syms) - set(base_syms)
+    removed = set(base_syms) - set(head_syms)
 
-    # §SB amended symbol budget (exact-equality, NOT subset). The diff
-    # INTRODUCES exactly three helpers and four module-data symbols, and REMOVES
-    # nothing. The two host functions (_save_codex_tokens / _refresh_codex_auth_tokens)
-    # are MODIFIED in place: their `def` lines predate this change, so they appear
-    # in neither the added- nor removed-symbol sets and are asserted separately
-    # via the hunk-scope check below.
-    added_funcs = set(re.findall(r"(?m)^\+def\s+([A-Za-z_]\w*)\s*\(", diff))
-    removed_funcs = set(re.findall(r"(?m)^-def\s+([A-Za-z_]\w*)\s*\(", diff))
-    added_data = set(re.findall(r"(?m)^\+([A-Za-z_][A-Za-z0-9_]*)\s*[:=]", diff))
-    removed_data = set(re.findall(r"(?m)^-([A-Za-z_][A-Za-z0-9_]*)\s*[:=]", diff))
-
-    expected_helpers = {
-        "_codex_token_identity",
-        "_write_through_codex_to_global_root",
-        "_reset_codex_root_rescue_seen",
+    # §SB amended budget: exactly these NEW top-level symbols.
+    expected_added = {
+        "_codex_token_identity",                    # helper (D-id identity computation)
+        "_write_through_codex_to_global_root",      # helper (C1/C2/C3 root RMW)
+        "_reset_codex_root_rescue_seen",            # hook (rescue cap reset)
+        "_CODEX_OAUTH_ISSUER",                      # constant (D-id issuer pin)
+        "_CODEX_ROOT_PERSIST_ATTEMPTS",             # constant (A1v10 retry count)
+        "_CODEX_ROOT_PERSIST_BACKOFF_SECONDS",      # constant (A1v10 backoff ladder)
+        "_codex_root_rescue_seen",                  # seen-set store
     }
-    expected_data = {
-        "_CODEX_OAUTH_ISSUER",
-        "_CODEX_ROOT_PERSIST_ATTEMPTS",
-        "_CODEX_ROOT_PERSIST_BACKOFF_SECONDS",
-        "_codex_root_rescue_seen",
-    }
-    assert added_funcs == expected_helpers, (
-        f"introduced-function budget {sorted(expected_helpers)} != {sorted(added_funcs)}"
+    assert added == expected_added, (
+        f"production-symbol additions EXACTLY {sorted(expected_added)} required; "
+        f"got added={sorted(added)}"
     )
-    assert added_data == expected_data, (
-        f"introduced-data budget {sorted(expected_data)} != {sorted(added_data)}"
-    )
-    assert removed_funcs == set(), f"no function may be removed: {removed_funcs}"
-    assert removed_data == set(), f"no module data may be removed: {removed_data}"
+    assert removed == set(), f"no production symbol may be removed: {sorted(removed)}"
 
-    # The two host functions must be the ONLY modified functions. The helper
-    # block lands in the diff hunk header of the following `_sync_codex_pool_entries`
-    # (insertion context, not a symbol this change authored).
-    modified = set(re.findall(r"(?m)^@@.*?\bdef\s+([A-Za-z_]\w*)\s*\(", diff))
+    # Of pre-existing symbols, ONLY the two host functions may have CHANGED
+    # bodies/defaults. Everything else must be AST-identical to merge-base.
     expected_modified = {"_save_codex_tokens", "_refresh_codex_auth_tokens"}
-    assert expected_modified <= modified, (
-        f"host functions must be modified; hunk scope was {modified}"
-    )
-    assert modified <= ({"_sync_codex_pool_entries"} | expected_modified), (
-        f"unexpected modified-function scope: {modified}"
+    changed_bodies = {
+        name for name in (set(base_syms) & set(head_syms))
+        if base_syms[name] != head_syms[name]
+    }
+    assert changed_bodies == expected_modified, (
+        f"only {sorted(expected_modified)} may be modified in place; "
+        f"found {sorted(changed_bodies)}"
     )
