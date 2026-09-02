@@ -1,6 +1,7 @@
 """Regression tests for task/session cwd propagation in terminal_tool."""
 
 import json
+import os
 from types import SimpleNamespace
 
 import tools.terminal_tool as terminal_tool
@@ -118,12 +119,20 @@ def test_explicit_workdir_does_not_persist_into_session_cwd(monkeypatch):
     assert all(cwd != "/one/off/dir" for _, cwd in recorded), recorded
 
 
-def test_background_command_prefers_recorded_session_cwd_over_init_time_cwd(monkeypatch):
+def test_background_command_prefers_recorded_session_cwd_over_init_time_cwd(monkeypatch, tmp_path):
     """Background process launches must also use the recorded session cwd."""
+    # Real directories: since the ghost-cwd guard, a recorded cwd that does
+    # not exist on disk is rejected as a deleted-directory ghost. The
+    # contract under test is record-vs-init precedence, not path existence,
+    # so both paths must be physically real.
+    live_dir = str(tmp_path / "live")
+    init_dir = str(tmp_path / "init")
+    os.makedirs(live_dir)
+    os.makedirs(init_dir)
 
     class FakeEnv:
         env = {}
-        cwd = "/workspace/live"
+        cwd = live_dir
 
     class FakeRegistry:
         def __init__(self):
@@ -141,8 +150,8 @@ def test_background_command_prefers_recorded_session_cwd_over_init_time_cwd(monk
     monkeypatch.setattr(terminal_tool, "_active_environments", {task_id: FakeEnv()})
     monkeypatch.setattr(terminal_tool, "_last_activity", {})
     monkeypatch.setattr(terminal_tool, "_session_cwd", {})
-    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {task_id: {"cwd": "/workspace/init"}})
-    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: _minimal_terminal_config(cwd="/workspace/init"))
+    monkeypatch.setattr(terminal_tool, "_task_env_overrides", {task_id: {"cwd": init_dir}})
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: _minimal_terminal_config(cwd=init_dir))
     monkeypatch.setattr(terminal_tool, "_start_cleanup_thread", lambda: None)
     monkeypatch.setattr(terminal_tool, "_resolve_container_task_id", lambda value: value or "default")
     monkeypatch.setattr(
@@ -151,7 +160,7 @@ def test_background_command_prefers_recorded_session_cwd_over_init_time_cwd(monk
         lambda command, env_type, **kwargs: {"approved": True},
     )
     monkeypatch.setattr(process_registry_mod, "process_registry", registry)
-    terminal_tool.record_session_cwd(task_id, "/workspace/live")
+    terminal_tool.record_session_cwd(task_id, live_dir)
 
     result = json.loads(
         terminal_tool.terminal_tool(
@@ -167,7 +176,7 @@ def test_background_command_prefers_recorded_session_cwd_over_init_time_cwd(monk
     # still find and terminate this background process.
     assert registry.calls == [{
         "command": "sleep 1",
-        "cwd": "/workspace/live",
+        "cwd": live_dir,
         "task_id": task_id,
         "owner_task_id": task_id,
         "session_key": task_id,
