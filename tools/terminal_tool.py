@@ -781,6 +781,28 @@ def _resolve_command_cwd(
             recorded, env_type, default_cwd,
         )
         return default_cwd
+    if (
+        recorded
+        and env_type == "local"
+        and not os.path.isdir(recorded)
+    ):
+        # Local backend: a recorded cwd whose directory no longer exists (the
+        # classic case is a Kanban worktree removed after `hermes kanban
+        # archive`) would make the shell's defensive `cd <cwd>` prefix fail
+        # with exit 126 BEFORE the command runs — every bare terminal call in
+        # the session dies until the record is healed. workdir=-scoped calls
+        # never update the record (they are transient by contract), so the
+        # ghost persists across turns. Fall back to the default cwd instead;
+        # the next successful un-scoped command re-records a real directory.
+        # Remote backends are deliberately NOT covered: their recorded paths
+        # resolve inside the remote host/sandbox, so a local isdir() proves
+        # nothing about them.
+        logger.info(
+            "Ignoring recorded session cwd %r (directory no longer exists on "
+            "the local backend). Using %r instead.",
+            recorded, default_cwd,
+        )
+        return default_cwd
     return recorded or default_cwd
 
 
