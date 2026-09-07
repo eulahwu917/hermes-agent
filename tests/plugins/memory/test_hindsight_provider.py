@@ -29,14 +29,16 @@ from plugins.memory.hindsight import (
     _load_config,
     _load_simple_env,
     _build_embedded_profile_env,
-    _normalize_min_scores,
     _normalize_observation_scopes,
     _normalize_retain_tags,
-    _VALID_MIN_SCORE_KEYS,
     _resolve_bank_id_template,
     _WRITER_SENTINEL,
 )
-from plugins.memory.hindsight.settings import _sanitize_bank_segment
+from plugins.memory.hindsight.settings import (
+    _normalize_min_scores,
+    _sanitize_bank_segment,
+    _VALID_MIN_SCORE_KEYS,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -927,7 +929,10 @@ class TestSyncTurn:
         assert len(call_kwargs["items"]) == 1
         item = call_kwargs["items"][0]
         assert item["context"] == "conversation between Hermes Agent and the User"
-        assert item["tags"] == ["conv", "session1", "session:session-1"]
+        # channel tag added by the thread-routing patch (auto-retained facts
+        # are tagged with their thread of origin).
+        assert item["tags"] == ["conv", "session1", "session:session-1",
+                                "channel:discord:1491249007475949698"]
         content = json.loads(item["content"])
         assert len(content) == 1
         assert content[0][0]["role"] == "user"

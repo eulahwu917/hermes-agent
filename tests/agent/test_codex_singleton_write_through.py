@@ -982,10 +982,16 @@ def _diff_text():
 
 
 def _auth_diff_text():
-    """Diff of the single production file under budget (auth.py) only."""
+    """Diff of the single production file under budget (auth_codex.py) only.
+
+    2026-09-06 rebase: upstream split the codex OAuth implementation out of
+    auth.py into auth_codex.py; the budget pin follows the implementation.
+    (auth.py keeps only lazy re-exports, which are import nodes — invisible to
+    the AST symbol map by design.)
+    """
     base = _diff_base()
-    committed = _git("diff", base, "HEAD", "--", "hermes_cli/auth.py").stdout or ""
-    worktree = _git("diff", base, "--", "hermes_cli/auth.py").stdout or ""
+    committed = _git("diff", base, "HEAD", "--", "hermes_cli/auth_codex.py").stdout or ""
+    worktree = _git("diff", base, "--", "hermes_cli/auth_codex.py").stdout or ""
     return committed + "\n" + worktree
 
 
@@ -1022,11 +1028,14 @@ def _ast_top_level_symbols(source_text: str) -> dict:
 
 
 def _auth_symbol_maps():
-    """{merge_base: symbols, worktree_HEAD: symbols} for hermes_cli/auth.py."""
+    """{merge_base: symbols, worktree_HEAD: symbols} for hermes_cli/auth_codex.py.
+
+    2026-09-06 rebase: production file is auth_codex.py (upstream module split).
+    """
     import ast as _ast
     base_sha = _diff_base()
-    base_text = _git("show", f"{base_sha}:hermes_cli/auth.py").stdout
-    head_path = os.path.join(_git_repo_root(), "hermes_cli", "auth.py")
+    base_text = _git("show", f"{base_sha}:hermes_cli/auth_codex.py").stdout
+    head_path = os.path.join(_git_repo_root(), "hermes_cli", "auth_codex.py")
     with open(head_path) as fh:
         head_text = fh.read()
     return (
@@ -1059,7 +1068,7 @@ def test_t18_dual_enumeration_budget_pin():
         os.environ.get("HERMES_T18_EXTRA_NONPROD", "").split(",") if p.strip()
     }
     allowed_nonprod |= extra
-    nonprod = {f for f in changed if f != "hermes_cli/auth.py"}
+    nonprod = {f for f in changed if f != "hermes_cli/auth_codex.py"}
     assert nonprod == allowed_nonprod, (
         f"non-production files must EXACTLY equal {sorted(allowed_nonprod)}; got {sorted(nonprod)}"
     )
