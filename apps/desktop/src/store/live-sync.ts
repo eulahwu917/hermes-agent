@@ -20,6 +20,9 @@ export const $cronChangeTick = atom(0)
 export const $sessionsChangeTick = atom(0)
 export const $platformsChangeTick = atom(0)
 export const $pairingChangeTick = atom(0)
+// Attention commits (RPC/CLI ack, Phase-3 receiver writes) bump the backend's
+// cron/attention.changed sentinel — the DB mtime never moves on WAL commits.
+export const $attentionChangeTick = atom(0)
 
 /** `pet.info.meta`-shaped payload carried on `pet.changed` — lets the pet skip
  *  the heavy sprite refetch when the broadcast already says enabled=false. */
@@ -65,6 +68,8 @@ export function notifyPairingChanged(): void {
 
 export function notifySetupReady(): void {
   $setupReadyTick.set($setupReadyTick.get() + 1)
+export function notifyAttentionChanged(): void {
+  $attentionChangeTick.set($attentionChangeTick.get() + 1)
 }
 
 /** Reset on gateway wipe/reconnect — a new backend re-advertises capability on

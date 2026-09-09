@@ -8,6 +8,19 @@ import { $gateway, ensureActiveGatewayOpen, isActivePrimary } from '@/store/gate
 import { $activeGatewayProfile } from '@/store/profile'
 import { $gatewayState, setConnection } from '@/store/session'
 
+/** Per-request scope pinning for callers whose target is tied to a
+ *  profile/connection that can be torn down mid-flight. */
+export interface GatewayRequestOptions {
+  /**
+   * Checked before the initial send, before every reconnect/retry, and again
+   * immediately before the recovered replay — a scope can be torn down while
+   * the asynchronous reconnect is in flight. When it reports false the
+   * request aborts instead of being replayed against the now-active route: a
+   * scope-pinned mutation must never act as the new scope's mutation.
+   */
+  scopeGuard?: () => boolean
+}
+
 export function useGatewayRequest() {
   const gatewayState = useStore($gatewayState)
   // Reactive companion to `gatewayRef`. The ref exists so `requestGateway`
@@ -46,7 +59,7 @@ export function useGatewayRequest() {
     []
   )
 
-  const ensureGatewayOpen = useCallback(async () => {
+  const ensureGatewayOpen = useCallback(async (scopeChanged?: () => boolean) => {
     const existing = gatewayRef.current
 
     if (!existing) {
@@ -85,6 +98,15 @@ export function useGatewayRequest() {
           'Timed out reconnecting to Hermes backend'
         )
 
+        // A scope-pinned request's target can be torn down while this IPC
+        // round-trip was in flight (the soft-apply path reuses the primary
+        // gateway OBJECT and re-homes it to the new backend). Publishing this
+        // descriptor now would clobber the newly selected primary's connection
+        // — bail instead; the caller re-validates before any replay.
+        if (scopeChanged?.()) {
+          return null
+        }
+
         connectionRef.current = conn
         setConnection(conn)
 
@@ -100,10 +122,31 @@ export function useGatewayRequest() {
           'Timed out re-minting the gateway WebSocket URL'
         )
 
+        // Same re-check between ticket mint and dial: the minted URL belongs
+        // to the scope this reconnect started under, and connecting the shared
+        // primary object after a switch would replace the new backend's
+        // socket.
+        if (scopeChanged?.()) {
+          return null
+        }
+
         await existing.connect(wsUrl)
 
         return existing
       } catch (error) {
+        // Scope ownership governs the failure continuation too: every await
+        // above (connection IPC, ticket mint, dial) can REJECT after a scope
+        // switch landed mid-flight, and that failure belongs to the torn-down
+        // scope. Clearing the connection here would erase the newly selected
+        // primary's published descriptor (setConnection drives scoped stores
+        // and remote-fs routing), and stashing a reauth error would later
+        // surface A's expired session as B's. Obsolete-scope failure handling
+        // is side-effect-free — the caller re-validates and aborts before any
+        // replay; the same-scope path below keeps its normal cleanup.
+        if (scopeChanged?.()) {
+          return null
+        }
+
         if (isGatewayReauthRequired(error)) {
           reauthErrorRef.current = error
         }
@@ -121,11 +164,26 @@ export function useGatewayRequest() {
   }, [])
 
   const requestGateway = useCallback(
-    async <T>(method: string, params: Record<string, unknown> = {}, timeoutMs?: number, signal?: AbortSignal) => {
+    async <T>(
+      method: string,
+      params: Record<string, unknown> = {},
+      timeoutMs?: number,
+      signal?: AbortSignal,
+      options?: GatewayRequestOptions
+    ) => {
       const gateway = gatewayRef.current
 
       if (!gateway) {
         throw new Error('Hermes gateway unavailable')
+      }
+
+      const scopeChanged = (): boolean =>
+        options?.scopeGuard !== undefined && !options.scopeGuard()
+
+      if (scopeChanged()) {
+        // The scope this request belongs to was torn down before the send:
+        // sending now would target the wrong backend, so abort instead.
+        throw new Error('gateway request scope changed before send')
       }
 
       try {
@@ -135,11 +193,28 @@ export function useGatewayRequest() {
           throw error
         }
 
+        // Recovery resolves from the CURRENT active route. A scope-pinned
+        // mutation must never retarget: when its scope was torn down
+        // mid-flight (profile/connection switch), replaying the method on the
+        // now-active gateway would route A's mutation at B. Abort instead.
+        if (scopeChanged()) {
+          throw new Error('gateway request scope changed before retry')
+        }
+
         // Primary keeps the OAuth-aware reconnect (remote gateways re-mint a
         // single-use ticket). Background profiles stay on the registry's
         // connection-owned reconnect path, including composite remote/SSH
         // sources.
-        const recovered = isActivePrimary() ? await ensureGatewayOpen() : await ensureActiveGatewayOpen()
+        const recovered = isActivePrimary() ? await ensureGatewayOpen(scopeChanged) : await ensureActiveGatewayOpen()
+
+        // Re-validate AFTER the asynchronous recovery: a scope can be torn
+        // down while the reconnect is in flight (the soft-apply path re-homes
+        // the primary gateway OBJECT this recovery shares), so a guard that
+        // passed before the await proves nothing about the socket the replayed
+        // send would use. Re-check immediately before replaying.
+        if (scopeChanged()) {
+          throw new Error('gateway request scope changed before replay')
+        }
 
         if (!recovered) {
           // Prefer the reauth error from the failed reconnect (OAuth session

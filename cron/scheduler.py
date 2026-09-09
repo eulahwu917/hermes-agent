@@ -333,7 +333,7 @@ def _upsert_incident_for_failure(
         withheld = state == "closed" or (state == "alerted" and _repeat_alert_withheld(incident))
         return withheld, incident_id
     except Exception as exc:
-        logger.debug(
+        logger.warning(
             "Incident store unavailable for job %s (delivery unaffected): %s",
             job["id"], exc)
         return False, None
@@ -2665,7 +2665,22 @@ def _compose_run_delivery(
         deliver_content = blocked_config_notice(job.get("name") or job["id"], _pf_text)
     elif success:
         deliver_content = final_response
-        _resolve_incidents_for_recovered_job(job)
+        # Per-job "alarm" flag (spec §3.1 item 4): a no_agent script's nonempty stdout is an
+        # alarm regardless of exit code — exit-0 alarm producers (health checks) mint/refresh an
+        # incident instead of passing silently green. SILENT_MARKER is the scheduler's own
+        # silence sentinel (empty stdout / wakeAgent=false), NOT alarm text: an alarm-flagged
+        # silent-green run must mint nothing. Best-effort: a store failure never turns the
+        # successful run into a failed one.
+        if (
+            job.get("alarm")
+            and job.get("no_agent")
+            and final_response not in (SILENT_MARKER,)
+            and str(final_response or "").strip()
+        ):
+            _upsert_incident_for_failure(job, final_response, output_file=output_file)
+        else:
+            # A genuinely-recovered successful run resolves the job's open incidents (upstream).
+            _resolve_incidents_for_recovered_job(job)
     else:
         # Record the job+error signature once; withhold the per-run ping while the operator
         # already acked it (closed) or was already told (alerted, inside the reminder cooldown).
