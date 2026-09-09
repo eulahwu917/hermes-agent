@@ -181,7 +181,10 @@ _CHANGE_WATCHES: dict[str, tuple[float, Any, Any]] = {
     "platforms.changed": (2.0, lambda: _home_mtime_ns("gateway_state.json"), lambda: {}),
     "pairing.changed": (2.0, _pairing_sig, lambda: {}),
     # 1s so a queued DM envelope reaches the Desktop's push-triggered drain fast.
-    "bot_relay.outbox.pending": (1.0, _bot_relay_outbox_sig, lambda: {})}
+    "bot_relay.outbox.pending": (1.0, _bot_relay_outbox_sig, lambda: {}),
+    # Attention commits (RPC/CLI ack, Phase-3 receiver writes) bump this sentinel — the
+    # executions.db mtime does NOT move on WAL commits, so never watch the DB file itself.
+    "attention.changed": (1.0, lambda: _home_mtime_ns("cron", "attention.changed"), lambda: {})}
 
 # state.db moves on every append of a streaming turn and gateway_state.json on
 # in-flight bookkeeping; the floor coalesces bursts to one broadcast per window,

@@ -1,11 +1,12 @@
-"""Durable cron failure incidents with signature dedup and ack.
+"""Durable cron failure incidents with signature dedup, episodic re-arm, and ack.
 
 The executions ledger records every attempt; this module groups the *failures* into incidents keyed
-by ``(job_id, error signature)`` so the same job failing with the same error does not re-ping the
-operator every run once acknowledged. Lifecycle: ``detected`` → ``alerted`` → ``closed``. The same
-job + same normalized error resolves to the SAME incident id, so a closed incident stays closed
-until the error text changes and mints a new one. ``alerted`` means a failure ping actually reached
-the operator. Incidents share ``cron/executions.db`` with ``cron.executions`` (one ledger file).
+by ``(job_id, error signature)`` so the same job failing with the same error re-pings the operator
+every run only until acknowledged. Lifecycle: ``detected`` → ``alerted`` → ``closed``. Within one
+episode, the same job + same normalized error resolves to the SAME incident id; a recurrence AFTER a
+closed row mints a NEW incident row (episodic re-arm — ack is NOT permanent suppression for a
+repeating alarm). ``alerted`` means a failure ping actually reached the operator. Incidents share
+``cron/executions.db`` with ``cron.executions`` (one ledger file).
 """
 
 from __future__ import annotations
@@ -136,9 +137,10 @@ def upsert_incident(
     output_file: Optional[str] = None,
 ) -> tuple[str, bool]:
     """Record (or refresh) the incident for ``job_id`` + ``error``; returns ``(incident_id,
-    is_new)``. An existing row for the signature refreshes
-    ``last_seen_at``/``error``/``output_file`` and keeps its state — a ``closed`` incident stays
-    closed. A changed error text mints a new incident."""
+    is_new)``. An OPEN row for the signature refreshes ``last_seen_at``/``error``/``output_file``
+    and keeps its state. A closed episode is never resurrected: the same signature recurring after
+    a close mints a NEW incident row (episodic re-arm), and a changed error text mints a new
+    signature."""
     job_id = str(job_id or "")
     sig = _error_signature(job_id, error)
     stored_error = _redact_error(error)
@@ -148,10 +150,14 @@ def upsert_incident(
     output_file = str(output_file) if output_file is not None else None
 
     with _transaction() as conn:
-        row = conn.execute(
-            "SELECT id FROM cron_incidents WHERE id=?", (incident_id,)
+        open_row = conn.execute(
+            """SELECT id FROM cron_incidents
+               WHERE job_id=? AND error_sig=? AND state != 'closed'
+               ORDER BY last_seen_at DESC, id DESC LIMIT 1""",
+            (job_id, sig),
         ).fetchone()
-        if row is not None:
+        if open_row is not None:
+            incident_id = open_row["id"]
             conn.execute(
                 """UPDATE cron_incidents
                    SET last_seen_at=?, error=?, output_file=?
@@ -159,6 +165,16 @@ def upsert_incident(
                 (now, stored_error, output_file, incident_id),
             )
             return incident_id, False
+        # No OPEN row for this signature: closed episodes stay closed — episodic re-arm
+        # mints a fresh episode row so one ack can never permanently suppress a repeating
+        # alarm (live-money/backup class). Episode ids extend the base id monotonically.
+        episode = conn.execute(
+            "SELECT COUNT(*) AS n FROM cron_incidents WHERE job_id=? AND error_sig=?",
+            (job_id, sig),
+        ).fetchone()
+        base_id = _incident_id(job_id, sig)
+        episode_n = int(episode["n"]) if episode is not None else 0
+        incident_id = base_id if episode_n == 0 else f"{base_id}_e{episode_n + 1}"
         conn.execute(
             """INSERT INTO cron_incidents
                (id, job_id, error_sig, state, failure_type,
@@ -199,8 +215,15 @@ def set_incident_state(incident_id: str, state: str) -> bool:
 
 
 def ack_incident(incident_id: str) -> bool:
-    """Acknowledge (close) an incident; ``False`` when missing or already closed."""
-    return set_incident_state(incident_id, "closed")
+    """Acknowledge (close) an incident; ``False`` when missing or already closed. A successful
+    close notifies the unified Attention view through the ``attention.changed`` sentinel (this is
+    the shared commit path for both the CLI and the RPC ack)."""
+    changed = set_incident_state(incident_id, "closed")
+    if changed:
+        from cron.attention import touch_attention_changed
+
+        touch_attention_changed()
+    return changed
 
 
 def _state_filter(state: Optional[str]) -> tuple[str, tuple]:

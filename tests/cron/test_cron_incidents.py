@@ -190,18 +190,21 @@ def test_lifecycle_transitions(monkeypatch, tmp_path):
     assert inc.count_incidents(state="bogus") == 0
 
 
-def test_acked_signature_stays_closed_on_refresh(monkeypatch, tmp_path):
-    """Ack is per-signature: upserting the same error after ack must NOT
-    resurrect the incident — a changed error is what mints a new one."""
+def test_acked_signature_rearms_new_episode_on_refresh(monkeypatch, tmp_path):
+    """Ack closes one EPISODE, not the signature forever (spec §3.1 item 2): upserting the same
+    error after an ack mints a NEW open row — episodic re-arm — while the closed row stays
+    closed. Permanent suppression for repeating alarms was the pre-existing test pin; the
+    behavior change here is deliberate."""
     inc = _point_db(monkeypatch, tmp_path)
     inc_id, _ = inc.upsert_incident("job-1", "same failure text")
     inc.ack_incident(inc_id)
 
-    same_id, is_new = inc.upsert_incident("job-1", "SAME FAILURE TEXT")
+    rearmed_id, is_new = inc.upsert_incident("job-1", "SAME FAILURE TEXT")
 
-    assert same_id == inc_id
-    assert is_new is False
+    assert rearmed_id != inc_id, "recurrence after close must mint a distinct episode id"
+    assert is_new is True
     assert inc.get_incident(inc_id)["state"] == "closed"
+    assert inc.get_incident(rearmed_id)["state"] == "detected"
 
 
 # ── Missing DB / lazy schema ───────────────────────────────────────────────
@@ -237,7 +240,11 @@ def test_unacked_failure_still_alerts(monkeypatch, tmp_path):
     assert rows[0]["state"] == "detected"
 
 
-def test_ack_suppresses_alert_until_signature_changes(monkeypatch, tmp_path):
+def test_ack_rearms_alert_on_same_signature_recurrence(monkeypatch, tmp_path):
+    """Episodic re-arm through the real scheduler delivery path (spec §3.1 item 2): an ack closes
+    one episode; the same signature recurring afterwards mints a NEW open episode and the failure
+    ping fires again — one ack can never permanently suppress a repeating alarm. The pre-existing
+    pin asserted permanent suppression; the behavior change here is deliberate."""
     inc = _point_db(monkeypatch, tmp_path)
     deliveries = []
     job = _job()
@@ -250,18 +257,21 @@ def test_ack_suppresses_alert_until_signature_changes(monkeypatch, tmp_path):
         assert len(rows) == 1 and rows[0]["state"] == "detected"
         inc_id = rows[0]["id"]
 
-        # Acknowledge it.
+        # Acknowledge it — closes THIS episode.
         assert inc.ack_incident(inc_id) is True
 
-        # Same signature: alert suppressed, incident stays closed.
+        # Same signature after close: episodic re-arm mints a NEW open episode and re-alerts.
         _tick_failing(job, tmp_path, deliveries, error="boom signature A")
-        assert len(deliveries) == 1, "acked signature must not re-ping"
-        assert inc.get_incident(inc_id)["state"] == "closed"
+        assert len(deliveries) == 2, "same signature after ack must re-arm and re-alert"
+        assert inc.get_incident(inc_id)["state"] == "closed", "the closed episode stays closed"
+        open_rows = [r for r in inc.list_incidents() if r["state"] != "closed"]
+        assert len(open_rows) == 1
+        assert open_rows[0]["id"] != inc_id
 
         # Changed signature: new incident, alert again.
         _tick_failing(job, tmp_path, deliveries, error="boom signature B")
-        assert len(deliveries) == 2, "changed signature must re-alert"
-        assert inc.count_incidents() == 2
+        assert len(deliveries) == 3, "changed signature must re-alert"
+        assert inc.count_incidents() == 3
 
 
 def test_mark_incident_alerted_sets_state_never_resurrects(monkeypatch, tmp_path):

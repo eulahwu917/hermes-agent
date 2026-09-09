@@ -860,6 +860,10 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     refreshHermesConfig,
     refreshMessagingSessions,
     refreshSessions,
+    // Attention is a NON-session surface scoped to the active connection +
+    // profile: hand the hook the raw ambient requester (which preserves the
+    // 5th-arg scopeGuard), never the focused-session dispatcher above.
+    attentionRequestGateway: ambientRequestGateway,
     requestGateway,
     updateSessionState
   })

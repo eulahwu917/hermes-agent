@@ -1,6 +1,7 @@
 import type { HermesSkin } from '@hermes/shared/skin'
 
 import {
+  notifyAttentionChanged,
   notifyCronChanged,
   notifyPairingChanged,
   notifyPetChanged,
@@ -47,7 +48,8 @@ export function handleLifecycleEvent(ctx: GatewayEventContext): boolean {
     event.type === 'cron.changed' ||
     event.type === 'sessions.changed' ||
     event.type === 'platforms.changed' ||
-    event.type === 'pairing.changed'
+    event.type === 'pairing.changed' ||
+    event.type === 'attention.changed'
   ) {
     // Change-watcher broadcasts (server._broadcast_watched_changes): the
     // backend's on-disk signature moved. Route to the live-sync ticks the
@@ -63,6 +65,8 @@ export function handleLifecycleEvent(ctx: GatewayEventContext): boolean {
         notifyPlatformsChanged()
       } else if (event.type === 'pairing.changed') {
         notifyPairingChanged()
+      } else if (event.type === 'attention.changed') {
+        notifyAttentionChanged()
       } else {
         notifySessionsChanged()
       }
