@@ -4,7 +4,9 @@ import { useQuery } from '@tanstack/react-query'
 import type * as React from 'react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
+import { useGatewayRequest } from '@/app/gateway/hooks/use-gateway-request'
 import { PageLoader } from '@/components/page-loader'
+import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Codicon } from '@/components/ui/codicon'
@@ -46,12 +48,16 @@ import {
 } from '@/hermes'
 import { type Translations, useI18n } from '@/i18n'
 import { AlertTriangle } from '@/lib/icons'
+import { localPreviewTarget } from '@/lib/local-preview'
 import { requestModelOptions } from '@/lib/model-options'
 import { asText } from '@/lib/text'
+import { $attentionItems, $attentionSyncState, type AttentionSyncState } from '@/store/attention'
 import { $cronFocusJobId, $cronJobs, invalidateCronJobsRequests, setCronFocusJobId } from '@/store/cron'
-import { $changeEventsAvailable, $cronChangeTick } from '@/store/live-sync'
+import { $attentionChangeTick, $changeEventsAvailable, $cronChangeTick } from '@/store/live-sync'
 import { notify, notifyError } from '@/store/notifications'
+import { openPreview } from '@/store/preview'
 import { $profileScope, ALL_PROFILES } from '@/store/profile'
+import type { AttentionItem } from '@/types/hermes'
 
 import { useRefreshHotkey } from '../hooks/use-refresh-hotkey'
 import {
@@ -73,6 +79,7 @@ import {
 } from '../overlays/panel'
 import type { SetStatusbarItemGroup } from '../shell/statusbar-controls'
 
+import { ackAttentionItem, AttentionScopeChangedError, refreshAttention } from './attention-actions'
 import { BlueprintSlotControl, blueprintSlotHelp, cleanBlueprintFieldError, initialBlueprintValues } from './blueprints'
 import { mutateAndRefreshCronJobs, refreshCronJobs, triggerAndRefreshCronJobs } from './cron-actions'
 import {
@@ -307,6 +314,80 @@ export function CronView({ onClose, onOpenSession, setStatusbarItemGroup: _setSt
   const [busyJobTokens, setBusyJobTokens] = useState<ReadonlyMap<string, symbol>>(() => new Map())
   const [triggeringJobKeys, setTriggeringJobKeys] = useState<ReadonlySet<string>>(() => new Set())
   const triggerControllerRef = useRef<CronTriggerController | null>(null)
+
+  // ── Attention (unified read model) — the alarm surface above the job list ──
+  const { requestGateway } = useGatewayRequest()
+  const attentionItems = useStore($attentionItems)
+  const attentionSyncState = useStore($attentionSyncState)
+  const attentionChangeTick = useStore($attentionChangeTick)
+  const [ackingAttentionIds, setAckingAttentionIds] = useState<ReadonlySet<string>>(() => new Set())
+
+  // Page-scoped liveness: immediate fetch on mount/attention-commit/focus (the global
+  // background sync owns the interval backstop + attention.changed tick).
+  useEffect(() => {
+    if (attentionChangeTick > 0) {
+      void refreshAttention(requestGateway)
+    }
+  }, [attentionChangeTick, requestGateway])
+
+  useEffect(() => {
+    void refreshAttention(requestGateway)
+
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') {
+        void refreshAttention(requestGateway)
+      }
+    }
+
+    document.addEventListener('visibilitychange', onVisible)
+
+    return () => document.removeEventListener('visibilitychange', onVisible)
+  }, [requestGateway])
+
+  async function handleAckAttention(item: AttentionItem) {
+    setAckingAttentionIds(current => new Set(current).add(item.id))
+
+    try {
+      await ackAttentionItem(requestGateway, item.kind, item.id)
+      // Refresh so the row leaves within this cycle; a list failure surfaces as the
+      // section's stale state instead of a phantom empty list.
+      const { error } = await refreshAttention(requestGateway)
+
+      if (error) {
+        notifyError(error, c.attention.ackFailed)
+      }
+    } catch (err) {
+      // A scope-changed ack belongs to a backend/profile the UI no longer
+      // shows — no toast, no stale flip; the new scope owns its own refresh.
+      // A same-scope failure leaves the row in place + error toast.
+      if (!(err instanceof AttentionScopeChangedError)) {
+        notifyError(err, c.attention.ackFailed)
+      }
+    } finally {
+      setAckingAttentionIds(current => {
+        const next = new Set(current)
+        next.delete(item.id)
+
+        return next
+      })
+    }
+  }
+
+  function handleViewAttentionOutput(item: AttentionItem) {
+    const path = item.output_file ?? item.evidence_ref
+
+    if (!path) {
+      notify({ kind: 'info', title: c.attention.title, message: c.attention.noOutput })
+
+      return
+    }
+
+    const target = localPreviewTarget(path)
+
+    if (target) {
+      openPreview(target, 'tool-result')
+    }
+  }
 
   // eslint-disable-next-line no-restricted-syntax -- controller mount identity, not an atom mirror
   useEffect(() => {
@@ -660,6 +741,14 @@ export function CronView({ onClose, onOpenSession, setStatusbarItemGroup: _setSt
             searchPlaceholder={c.search}
             searchValue={query}
           >
+            <AttentionSection
+              ackingIds={ackingAttentionIds}
+              c={c}
+              items={attentionItems}
+              onAck={item => void handleAckAttention(item)}
+              onViewOutput={handleViewAttentionOutput}
+              syncState={attentionSyncState}
+            />
             {visibleJobs.map(job => (
               <CronJobListRow
                 active={selectedJob?.id === job.id}
@@ -1429,4 +1518,105 @@ interface EditorValues {
 interface ScheduleOption {
   expr?: string
   value: string
+}
+
+// ── Attention section ───────────────────────────────────────────────────────────
+// Open incidents/alert-events above the job list. Sync-state contract: 'loading' →
+// spinner; 'live' + empty → explicit all-clear; 'stale' → last-known rows + explicit
+// stale notice. A failed read/ack must NEVER render as an empty, healthy list.
+
+function AttentionSection({
+  ackingIds,
+  c,
+  items,
+  onAck,
+  onViewOutput,
+  syncState
+}: {
+  ackingIds: ReadonlySet<string>
+  c: Translations['cron']
+  items: AttentionItem[]
+  onAck: (item: AttentionItem) => void
+  onViewOutput: (item: AttentionItem) => void
+  syncState: AttentionSyncState
+}) {
+  const stale = syncState === 'stale'
+
+  return (
+    <div className="mb-1.5 border-b border-border/60 pb-1.5">
+      <PanelSectionLabel className="px-2">{c.attention.title}</PanelSectionLabel>
+
+      {syncState === 'loading' && items.length === 0 ? (
+        <div className="flex items-center gap-1.5 px-2 py-1 text-xs text-muted-foreground">
+          <Codicon name="loading" size="0.75rem" spinning />
+          <span>{c.attention.loading}</span>
+        </div>
+      ) : stale && items.length === 0 ? (
+        <div className="flex items-start gap-1.5 px-2 py-1 text-xs text-destructive" role="alert">
+          <AlertTriangle className="mt-px size-3 shrink-0" />
+          <span>{c.attention.staleEmpty}</span>
+        </div>
+      ) : items.length === 0 ? (
+        <div className="px-2 py-1 text-xs text-muted-foreground">{c.attention.empty}</div>
+      ) : (
+        <div className="flex flex-col gap-1.5 px-2 pt-1">
+          {items.map(item => {
+            const acking = ackingIds.has(item.id)
+            const hasOutput = Boolean(item.output_file ?? item.evidence_ref)
+
+            return (
+              <div
+                className="rounded-md border border-border/70 bg-background/40 p-1.5"
+                data-attention-row="true"
+                key={`${item.kind}:${item.id}`}
+              >
+                <div className="flex items-start justify-between gap-2">
+                  <span className="min-w-0 overflow-hidden text-ellipsis whitespace-nowrap text-xs font-medium text-foreground">
+                    {item.title}
+                  </span>
+                  <Badge size="xs" variant={item.severity === 'critical' ? 'destructive' : 'warn'}>
+                    {item.severity}
+                  </Badge>
+                </div>
+                {item.error_sig ? (
+                  <div className="mt-0.5 overflow-hidden text-ellipsis whitespace-nowrap font-mono text-[0.62rem] text-muted-foreground/55">
+                    {item.error_sig}
+                  </div>
+                ) : null}
+                <div className="mt-0.5 text-[0.62rem] tabular-nums text-muted-foreground/65">
+                  {c.attention.firstSeen}: {formatTime(item.first_seen_at)} · {c.attention.lastSeen}:{' '}
+                  {formatTime(item.last_seen_at)}
+                </div>
+                {item.body_excerpt ? (
+                  <div className="mt-1 line-clamp-2 break-words text-[0.68rem] leading-snug text-muted-foreground/80">
+                    {item.body_excerpt}
+                  </div>
+                ) : null}
+                <div className="mt-1.5 flex items-center gap-1.5">
+                  <Button disabled={acking} onClick={() => onAck(item)} size="xs" variant="outline">
+                    {acking ? c.attention.acking : c.attention.ack}
+                  </Button>
+                  <Button
+                    disabled={!hasOutput}
+                    onClick={() => onViewOutput(item)}
+                    size="xs"
+                    variant="ghost"
+                  >
+                    {c.attention.viewOutput}
+                  </Button>
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      )}
+
+      {stale && items.length > 0 ? (
+        <div className="mt-1 flex items-start gap-1.5 px-2 text-[0.68rem] text-destructive" role="alert">
+          <AlertTriangle className="mt-px size-3 shrink-0" />
+          <span>{c.attention.stale}</span>
+        </div>
+      ) : null}
+    </div>
+  )
 }

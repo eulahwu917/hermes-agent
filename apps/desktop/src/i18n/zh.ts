@@ -2607,6 +2607,22 @@ export const zh = defineLocale({
     close: '关闭定时任务',
     title: '定时任务',
     count: count => `${count} 个任务`,
+    attention: {
+      title: '注意',
+      empty: '暂无待处理事项',
+      loading: '正在加载提醒…',
+      ack: '确认',
+      acking: '确认中…',
+      ackFailed: '确认失败',
+      viewOutput: '查看输出',
+      noOutput: '该项没有记录输出文件',
+      firstSeen: '首次发现',
+      lastSeen: '最近发现',
+      stale: '提醒数据不可用 — 显示最近已知条目',
+      staleEmpty: '提醒数据不可用 — 可能存在未处理事项',
+      openBadge: count => `${count} 项待处理提醒`,
+      staleBadge: '提醒不可用'
+    },
     modelImpact: {
       title: '定时任务将继续使用原模型',
       message: count => `${count} 个未固定的定时任务将继续使用创建时的模型运行。固定它们或设置 cron.model 以迁移。`,

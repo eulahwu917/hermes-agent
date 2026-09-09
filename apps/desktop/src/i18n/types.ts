@@ -2091,6 +2091,22 @@ export interface Translations {
     close: string
     title: string
     count: (count: number) => string
+    attention: {
+      title: string
+      empty: string
+      loading: string
+      ack: string
+      acking: string
+      ackFailed: string
+      viewOutput: string
+      noOutput: string
+      firstSeen: string
+      lastSeen: string
+      stale: string
+      staleEmpty: string
+      openBadge: (count: number) => string
+      staleBadge: string
+    }
     modelImpact: {
       title: string
       message: (count: number) => string

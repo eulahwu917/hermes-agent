@@ -1494,6 +1494,36 @@ export interface CronModelImpact {
   jobs: CronModelImpactJob[]
 }
 
+/** One Attention item from the unified read model (cron.manage list_attention).
+ *  The raw cron_incidents schema never crosses the wire — this IS the item shape.
+ *  kind-specific metadata: cron_incident adds job_id/job_name/error_sig/output_file;
+ *  alert_event adds producer/alert_type. */
+export interface AttentionItem {
+  kind: 'cron_incident' | 'alert_event'
+  id: string
+  source: string
+  severity: 'critical' | 'warning' | 'info'
+  title: string
+  body_excerpt: string
+  first_seen_at: string | null
+  last_seen_at: string | null
+  state: 'open' | 'closed'
+  acked_at: string | null
+  evidence_ref?: string | null
+  job_id?: string
+  job_name?: string | null
+  error_sig?: string
+  output_file?: string | null
+  producer?: string
+  alert_type?: string
+}
+
+/** ack_attention outcome: closed-ok / already-closed (changed:false). */
+export interface AttentionAckResult {
+  status: 'closed-ok' | 'already-closed'
+  changed: boolean
+}
+
 /** One skill-hub source (official index, GitHub, skills.sh, …) as reported by
  *  `GET /api/skills/hub/sources`. */
 export interface SkillHubSource {

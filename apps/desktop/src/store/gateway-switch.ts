@@ -4,6 +4,7 @@ import { resetLiveRuntimeTracking } from '@/app/contrib/hooks/use-background-syn
 import { resetSidebarBatchCapability } from '@/hermes'
 import { invalidateProfileScopedQueries } from '@/lib/query-client'
 import { clearArtifactRegistry } from '@/store/artifacts'
+import { resetAttention } from '@/store/attention'
 import { invalidateCronJobsRequests, setCronJobs } from '@/store/cron'
 import { resetSessionsLimit } from '@/store/layout'
 import { resetLiveSync } from '@/store/live-sync'
@@ -197,6 +198,9 @@ export function wipeSessionListsForGatewaySwitch(): void {
   setCronSessions([])
   invalidateCronJobsRequests()
   setCronJobs([])
+  // Attention is backend/home-scoped like cron jobs: the previous gateway's rows
+  // must not render under the next one, and its in-flight reads/acks are void.
+  resetAttention()
   setMessagingSessions([])
   setMessagingPlatformTotals({})
   setMessagingTruncated(false)
