@@ -2587,6 +2587,35 @@ export const en: Translations = {
     close: 'Close cron',
     title: 'Scheduled jobs',
     count: count => `${count} ${count === 1 ? 'job' : 'jobs'}`,
+
+    attention: {
+      title: 'Attention',
+      empty: 'No open attention items',
+      loading: 'Loading attention…',
+      ack: 'Ack',
+      acking: 'Acking…',
+      ackFailed: 'Failed to acknowledge incident',
+      viewOutput: 'View output',
+      noOutput: 'No output file recorded for this item',
+      firstSeen: 'First seen',
+      lastSeen: 'Last seen',
+      stale: 'Attention unavailable — showing last known items',
+      staleEmpty: 'Attention unavailable — open items may exist',
+      openBadge: count => `${count} open attention ${count === 1 ? 'item' : 'items'}`,
+      staleBadge: 'Attention unavailable'
+    },
+    modelImpact: {
+      title: 'Scheduled jobs stay on their original model',
+      message: count =>
+        `${count} unpinned scheduled ${count === 1 ? 'job keeps' : 'jobs keep'} running on the model ${count === 1 ? 'it was' : 'they were'} created under. Pin ${count === 1 ? 'it' : 'them'} or set cron.model to move ${count === 1 ? 'it' : 'them'}.`,
+      detailMore: (names, remaining) => `${names} and ${remaining} more`,
+      review: 'Review scheduled jobs',
+      saveFailed: 'Hermes did not save that model change.',
+      confirmTitle: 'Model Selection Warning',
+      confirmDetail: 'Confirm only if you accept this trade-off.',
+      confirmAction: 'Confirm',
+      declined: 'Model change cancelled — you declined the data-training tier warning.'
+    },
     search: 'Search cron jobs...',
     loading: 'Loading cron jobs...',
     states: {
