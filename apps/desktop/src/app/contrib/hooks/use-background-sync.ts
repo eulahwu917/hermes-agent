@@ -2,11 +2,13 @@ import { useStore } from '@nanostores/react'
 import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
 
 import { graftRefreshedTailOntoBackfill } from '@/app/chat/transcript-backfill'
+import { refreshAttention } from '@/app/cron/attention-actions'
 import { getLatestSessionMessages, type ProfileScope } from '@/hermes'
 import { preserveLocalAssistantErrors, sealOpenToolParts, toChatMessages } from '@/lib/chat-messages'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import { sessionMessagesSignature } from '@/lib/session-signatures'
-import { $changeEventsAvailable, $cronChangeTick, $sessionsChangeTick } from '@/store/live-sync'
+import { markAttentionStale, resetAttention } from '@/store/attention'
+import { $attentionChangeTick, $changeEventsAvailable, $cronChangeTick, $sessionsChangeTick } from '@/store/live-sync'
 import { $onBattery, batteryPollInterval } from '@/store/power'
 import { refreshActiveProfile } from '@/store/profile'
 import { refreshProjectTree } from '@/store/projects'
@@ -291,6 +293,11 @@ export async function reconcileActiveTranscript({
 // (no `change_events` on gateway.ready) they stay at the legacy cadence.
 const CRON_POLL_INTERVAL_MS = 30_000
 const CRON_BACKSTOP_INTERVAL_MS = 5 * 60_000
+// Attention is the alarm surface: same 30s cadence for both poll and event backstop —
+// the cross-process refresh contract (CLI ack → sentinel → attention.changed) is bounded
+// by one backstop period even when the event stream is degraded.
+const ATTENTION_POLL_INTERVAL_MS = 30_000
+const ATTENTION_BACKSTOP_INTERVAL_MS = 30_000
 const MESSAGING_POLL_INTERVAL_MS = 10_000
 const ACTIVE_MESSAGING_SESSION_POLL_INTERVAL_MS = 5_000
 const ACTIVE_MESSAGING_SESSION_BACKSTOP_INTERVAL_MS = 30_000
@@ -499,6 +506,15 @@ interface BackgroundSyncParams {
   refreshHermesConfig: () => Promise<unknown> | unknown
   refreshMessagingSessions: () => Promise<unknown> | unknown
   refreshSessions: () => Promise<unknown> | unknown
+  /** The raw AMBIENT gateway requester for the non-session Attention surface.
+   *  Never the session dispatcher: list_attention is scoped to the ACTIVE
+   *  connection/profile, while the dispatcher routes ambient calls by the
+   *  focused (possibly other-profile) session and forwards only four
+   *  arguments (it would drop the refresh's 5th-arg scopeGuard). Reading
+   *  through the dispatcher sends this poll to the focused tile's backend,
+   *  whose snapshot — including an empty one — would clear the ambient page's
+   *  badge or render that backend's rows there. */
+  attentionRequestGateway: GatewayRequester
   requestGateway: GatewayRequester
   updateSessionState: (
     sessionId: string,
@@ -572,11 +588,14 @@ export function useBackgroundSync({
   refreshHermesConfig,
   refreshMessagingSessions,
   refreshSessions,
+  attentionRequestGateway,
   requestGateway,
   updateSessionState
 }: BackgroundSyncParams): void {
   const changeEventsAvailable = useStore($changeEventsAvailable)
   const cronChangeTick = useStore($cronChangeTick)
+  const attentionChangeTick = useStore($attentionChangeTick)
+  const sessionsChangeTick = useStore($sessionsChangeTick)
   const activeTranscriptBusy = useStore($busy)
   const activeTranscriptRefreshPendingRef = useRef<string | null>(null)
   // Tile reconcile state (#93942 slice 1): shared sequence guard + per-tile
@@ -863,6 +882,72 @@ export function useBackgroundSync({
       () => void refreshCronJobs()
     )
   }, [changeEventsAvailable, cronChangeTick, gatewayState, refreshCronJobs])
+
+  // Attention list lives behind the cron.manage RPC; its commits (ack from THIS app,
+  // CLI acks, Phase-3 receiver writes) never move jobs.json, so cron.changed does not
+  // fire for them — attention.changed (sentinel) drives the refresh, with the visible
+  // poll as the backstop. Failures mark the store stale; never an empty list.
+  //
+  // Read through the raw AMBIENT requester, not the session dispatcher: Attention is
+  // scoped to the active connection/profile (the scopeKey below), while the dispatcher
+  // routes ambient RPCs by the FOCUSED session and forwards only four arguments (it would
+  // drop the refresh's scopeGuard). Routing this read through the dispatcher sends it to
+  // a focused other-profile tile, whose snapshot — including an empty one — would clear
+  // A's badge or render B's rows on A's page.
+  //
+  // Scope (connection + profile) bound: the cache belongs to ONE backend/home. A scope
+  // change resets the store (A's rows never render under B; the generation guard drops
+  // A's late responses) and reseeds from the new scope. A socket drop (open → non-open)
+  // marks stale and retains last-known rows — the badge must never sit silently green,
+  // and a settled live-empty list must not survive a disconnect as a phantom all-clear.
+  const attentionScopeRef = useRef<string>('')
+  const attentionWasOpenRef = useRef(false)
+
+  // eslint-disable-next-line no-restricted-syntax -- non-atom prop mirrors driving reset-on-switch / stale-on-disconnect (rule docstring sanctions prop mirrors)
+  useEffect(() => {
+    const scopeKey = `${activeConnectionId}:${activeGatewayProfile}`
+
+    const scopeChanged =
+      attentionScopeRef.current !== '' && attentionScopeRef.current !== scopeKey
+
+    attentionScopeRef.current = scopeKey
+
+    if (scopeChanged) {
+      resetAttention()
+    }
+
+    if (gatewayState !== 'open') {
+      // Disconnected/reconnecting: Attention is UNKNOWN — stale, never green.
+      // (Boot stays 'loading' until the first real fetch succeeds.)
+      if (attentionWasOpenRef.current) {
+        markAttentionStale()
+      }
+
+      return
+    }
+
+    attentionWasOpenRef.current = true
+
+    // Seed the store as soon as the gateway opens — the badge must not sit in
+    // its pre-first-fetch state until the first interval tick.
+    void refreshAttention(attentionRequestGateway)
+
+    if (attentionChangeTick > 0) {
+      void refreshAttention(attentionRequestGateway)
+    }
+
+    return visiblePoll(
+      changeEventsAvailable ? ATTENTION_BACKSTOP_INTERVAL_MS : ATTENTION_POLL_INTERVAL_MS,
+      () => void refreshAttention(attentionRequestGateway)
+    )
+  }, [
+    activeConnectionId,
+    activeGatewayProfile,
+    attentionChangeTick,
+    changeEventsAvailable,
+    gatewayState,
+    attentionRequestGateway
+  ])
 
   // A busy transition only consumes a pending sessions.changed refresh. It
   // never creates one, so an ordinary local turn going busy -> idle does not

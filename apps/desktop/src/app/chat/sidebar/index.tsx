@@ -6,6 +6,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useLocation } from 'react-router'
 
 import { PlatformAvatar } from '@/app/messaging/platform-icon'
+import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { ContextMenu, ContextMenuContent, ContextMenuTrigger } from '@/components/ui/context-menu'
@@ -29,6 +30,7 @@ import { comboTokens } from '@/lib/keybinds/combo'
 import { sessionMatchesSearch } from '@/lib/session-search'
 import { normalizeSessionSource, sessionSourceLabel } from '@/lib/session-source'
 import { cn } from '@/lib/utils'
+import { $attentionOpenCount, $attentionSyncState } from '@/store/attention'
 import { $activeConnectionId } from '@/store/connections'
 import { $cronJobs } from '@/store/cron'
 import { $bindings } from '@/store/keybinds'
@@ -366,6 +368,10 @@ export function ChatSidebar({
   )
 
   const panesFlipped = useStore($panesFlipped)
+  // Attention badge for the Scheduled-jobs nav row: derived from the LIVE attention
+  // list (never a stale cache); a failed read shows an explicit stale marker.
+  const attentionOpenCount = useStore($attentionOpenCount)
+  const attentionSyncState = useStore($attentionSyncState)
   const grouping = useStore($sidebarGrouping)
   const ordering = useStore($sidebarOrdering)
   const statusFilter = useStore($sidebarStatusFilter)
@@ -1561,6 +1567,23 @@ export function ChatSidebar({
                     <span className="min-w-0 truncate" data-tip-arrow-only="" data-tour={`sidebar-nav-${item.id}`}>
                       {s.nav[item.id] ?? item.label}
                     </span>
+                    {item.id === 'cron' && attentionSyncState === 'live' && attentionOpenCount > 0 ? (
+                      <Badge
+                        aria-label={s.nav.cron}
+                        className="ml-auto"
+                        data-attention-nav-badge="true"
+                        size="xs"
+                        variant="warn"
+                      >
+                        {attentionOpenCount}
+                      </Badge>
+                    ) : item.id === 'cron' && attentionSyncState === 'stale' ? (
+                      <span
+                        aria-label={t.cron.attention.staleBadge}
+                        className="ml-auto inline-block size-1.5 rounded-full bg-amber-500"
+                        data-stale-attention-indicator="true"
+                      />
+                    ) : null}
                     {isNewSession && (
                       <KbdGroup
                         className={cn('ml-auto opacity-55', newSessionKbdFlash && 'opacity-100!')}
