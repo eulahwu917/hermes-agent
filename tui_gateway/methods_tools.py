@@ -1029,6 +1029,35 @@ def _(rid, params: dict) -> dict:
         "missing_servers": sorted(missing_servers), "reset": bool(session), "unknown": unknown})
 
 
+def _attention_filters(params: dict) -> tuple:
+    """Strict ``list_attention`` filter validation (spec §3.1 R2 residual / §4.2): the RAW
+    supplied values are validated BEFORE any lossy coercion. ``open_only`` must be a real bool
+    when supplied (omitted/null keeps the documented default True — an unknown string or any
+    object must never quietly coerce to False); ``state`` must be a wire-state string when
+    supplied (omitted/null = no filter — falsey non-strings such as false/0/''/[]/{} are
+    INVALID supplied values, never silently None). The ``state`` VALUE check stays in
+    ``cron.attention.list_attention`` (same 4066 error path)."""
+    raw_open = params.get("open_only")
+    if raw_open is None:
+        open_only = True
+    elif isinstance(raw_open, bool):
+        open_only = raw_open
+    else:
+        raise ValueError(
+            f"invalid attention filter: open_only must be a boolean, got "
+            f"{type(raw_open).__name__}")
+    raw_state = params.get("state")
+    if raw_state is None:
+        state = None
+    elif isinstance(raw_state, str) and raw_state.strip():
+        state = raw_state.strip()
+    else:
+        raise ValueError(
+            f"invalid attention state filter: {raw_state!r} "
+            f"(expected ('open', 'closed'))")
+    return open_only, state
+
+
 # ─── Cron / learning / skills ────────────────────────────────────────────────
 @_scoped_rpc("cron.manage", 5023)
 def _(rid, params: dict) -> dict:
@@ -1054,6 +1083,32 @@ def _(rid, params: dict) -> dict:
         return _ok(rid, json.loads(raw))
     if action in {"remove", "pause", "resume"}:
         return _ok(rid, json.loads(cronjob(action=action, job_id=jid)))
+    if action in {"list_attention", "ack_attention"}:
+        # Unified Attention read model (spec §4.2): the wire schema is cron.attention's item
+        # shape — the raw incidents schema never crosses RPC. Strict filter validation: an
+        # invalid state/filter value is an explicit ERROR, never an empty list.
+        attention = _tools_mod("cron.attention")
+        if action == "list_attention":
+            try:
+                # RAW params first (never coerce before validating): is_truthy_value maps
+                # unknown strings to False and _str_arg collapses falsey values to '' —
+                # both would silently turn malformed filters into successful queries.
+                open_only, state = _attention_filters(params)
+                items = attention.list_attention(open_only=open_only, state=state)
+            except ValueError as exc:
+                return _err(rid, 4066, str(exc))
+            return _ok(rid, {"items": items, "count": len(items)})
+        kind = _str_arg(params, "kind")
+        item_id = _str_arg(params, "id")
+        if not kind or not item_id:
+            return _err(rid, 4063, "kind and id required")
+        try:
+            outcome = attention.ack_attention(kind, item_id)
+        except attention.InvalidAttentionKind as exc:
+            return _err(rid, 4066, str(exc))
+        except attention.UnknownAttentionItem as exc:
+            return _err(rid, 4065, f"unknown-id: {exc}")
+        return _ok(rid, outcome)
     return _err(rid, 4016, f"unknown cron action: {action}")
 
 
