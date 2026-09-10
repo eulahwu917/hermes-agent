@@ -73,12 +73,14 @@ def _capturing_client(results=None, reflect_text="synthesized", recall_error=Non
 
 def _desktop_provider(tmp_path, monkeypatch, *, config=None, routing=None,
                       routing_raw=None, platform="desktop", thread_id="",
-                      results=None, reflect_text="synthesized", recall_error=None):
+                      results=None, reflect_text="synthesized", recall_error=None,
+                      drop_keys=()):
     """Initialized provider with a capturing fake client.
 
     ``routing`` (dict) is written as thread_routing.json; ``routing_raw``
     (str) writes arbitrary file content for malformed-table cases; neither
-    means no routing file at all.
+    means no routing file at all. ``drop_keys`` removes config keys after the
+    merge so tests can exercise GENUINE key absence (vs. a null value).
     """
     cfg = {
         "mode": "cloud",
@@ -89,6 +91,8 @@ def _desktop_provider(tmp_path, monkeypatch, *, config=None, routing=None,
         "desktop_context_root": str(tmp_path / "desktop-context"),
     }
     cfg.update(config or {})
+    for key in drop_keys:
+        cfg.pop(key, None)
     cfg_path = tmp_path / "hindsight" / "config.json"
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
     cfg_path.write_text(json.dumps(cfg))
@@ -122,6 +126,21 @@ def _pack(root, *domains):
     root.mkdir(parents=True, exist_ok=True)
     for domain in domains:
         (root / domain).mkdir()
+
+
+# Distinctive nonempty baseline used across the fail-open matrix (R5 residual
+# 3c): fail-open means the CONFIGURED filter survives verbatim, so the
+# None-baseline shape ("tags" absent from outgoing kwargs) cannot be the only
+# pinned behavior.
+_BASELINE_CFG = {"recall_tags": ["baseline-tag"], "recall_tags_match": "all_strict"}
+_BASELINE_TAGS = ["baseline-tag"]
+_BASELINE_MATCH = "all_strict"
+
+
+def _assert_baseline_kwargs(call):
+    """The configured baseline filter reached the backend unchanged."""
+    assert call["tags"] == _BASELINE_TAGS
+    assert call["tags_match"] == _BASELINE_MATCH
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +225,24 @@ class TestOutgoingFilterDomain:
         assert all(c["tags"] == ["infrastructure"] for c in client.recall_calls)
         assert json.loads(raw)["result"] == "No relevant memories found."
 
+    def test_reflect_empty_bank_positive_control(self, tmp_path, monkeypatch):
+        # Mirror of the recall empty-bank control for the _reflect entry point
+        # (§3.8.1): zero hits must still CALL the backend once with the domain
+        # filter and succeed — distinct from the timeout/error path, which
+        # raises and records no success signal.
+        p, client, root = _desktop_provider(
+            tmp_path, monkeypatch, routing=self.ROUTING, results=[])
+        _pack(root, "infrastructure")
+        token = _bind(root, "infrastructure")
+        try:
+            out = p._reflect("anything")
+        finally:
+            runtime_cwd._SESSION_CWD.reset(token)
+        assert out == "synthesized"
+        assert len(client.reflect_calls) == 1
+        assert client.reflect_calls[0]["tags"] == ["infrastructure"]
+        assert client.reflect_calls[0]["tags_match"] == "any_strict"
+
 
 # ---------------------------------------------------------------------------
 # §3.8.2 — two-session interleaved isolation + real setter binding
@@ -263,6 +300,10 @@ class TestFailOpenMatrix:
     ROUTING = {
         "infrastructure": {"extra_tags": ["infrastructure"]},
         "investments": {"extra_tags": ["investments"]},
+        # Active route for the symlink-escape test (R5 residual 3a): the
+        # lexical link component must NOT route — only its resolved
+        # (outside-root) target matters.
+        "escape-link": {"extra_tags": ["escape-link"]},
     }
 
     def test_unbound_context_terminal_scope_wins_not_launch_dir(self, tmp_path, monkeypatch):
@@ -277,6 +318,9 @@ class TestFailOpenMatrix:
         assert client.recall_calls[0]["tags"] == ["infrastructure"]
 
     def test_cleared_context_no_terminal_cwd_global_baseline(self, tmp_path, monkeypatch):
+        # Intentional None-baseline control (R5 residual 3c): unfiltered
+        # baseline stays pinned as "no tags kwarg at all" alongside the
+        # nonempty-baseline matrix above.
         p, client, root = _desktop_provider(tmp_path, monkeypatch, routing=self.ROUTING)
         _pack(root, "infrastructure")
         p._recall("q")
@@ -286,7 +330,8 @@ class TestFailOpenMatrix:
     def test_nonexistent_session_override_is_final_over_valid_terminal_cwd(self, tmp_path, monkeypatch):
         # A NONEMPTY but nonexistent session override returns None and does NOT
         # fall through to a valid competing terminal cwd (§3.1 finality).
-        p, client, root = _desktop_provider(tmp_path, monkeypatch, routing=self.ROUTING)
+        p, client, root = _desktop_provider(
+            tmp_path, monkeypatch, routing=self.ROUTING, config=_BASELINE_CFG)
         _pack(root, "investments")
         monkeypatch.setenv("TERMINAL_CWD", str(root / "investments"))
         token = runtime_cwd.set_session_cwd(str(tmp_path / "ghost-dir"))
@@ -294,10 +339,11 @@ class TestFailOpenMatrix:
             p._recall("q")
         finally:
             runtime_cwd._SESSION_CWD.reset(token)
-        assert "tags" not in client.recall_calls[0]
+        _assert_baseline_kwargs(client.recall_calls[0])
 
     def test_outside_root(self, tmp_path, monkeypatch):
-        p, client, root = _desktop_provider(tmp_path, monkeypatch, routing=self.ROUTING)
+        p, client, root = _desktop_provider(
+            tmp_path, monkeypatch, routing=self.ROUTING, config=_BASELINE_CFG)
         _pack(root, "infrastructure")
         elsewhere = tmp_path / "elsewhere"
         elsewhere.mkdir()
@@ -306,99 +352,127 @@ class TestFailOpenMatrix:
             p._recall("q")
         finally:
             runtime_cwd._SESSION_CWD.reset(token)
-        assert "tags" not in client.recall_calls[0]
+        _assert_baseline_kwargs(client.recall_calls[0])
 
     def test_cwd_equals_root(self, tmp_path, monkeypatch):
-        p, client, root = _desktop_provider(tmp_path, monkeypatch, routing=self.ROUTING)
+        p, client, root = _desktop_provider(
+            tmp_path, monkeypatch, routing=self.ROUTING, config=_BASELINE_CFG)
         _pack(root, "infrastructure")
         token = runtime_cwd.set_session_cwd(str(root))
         try:
             p._recall("q")
         finally:
             runtime_cwd._SESSION_CWD.reset(token)
-        assert "tags" not in client.recall_calls[0]
+        _assert_baseline_kwargs(client.recall_calls[0])
 
     def test_unmatched_domain(self, tmp_path, monkeypatch):
-        p, client, root = _desktop_provider(tmp_path, monkeypatch, routing=self.ROUTING)
+        p, client, root = _desktop_provider(
+            tmp_path, monkeypatch, routing=self.ROUTING, config=_BASELINE_CFG)
         _pack(root, "unrouted-domain")
         token = runtime_cwd.set_session_cwd(str(root / "unrouted-domain"))
         try:
             p._recall("q")
         finally:
             runtime_cwd._SESSION_CWD.reset(token)
-        assert "tags" not in client.recall_calls[0]
+        _assert_baseline_kwargs(client.recall_calls[0])
 
     @pytest.mark.parametrize("entry", [{}, {"extra_tags": None}, {"extra_tags": []}])
     def test_empty_null_missing_tags_keep_baseline(self, tmp_path, monkeypatch, entry):
         p, client, root = _desktop_provider(
-            tmp_path, monkeypatch, routing={"infrastructure": entry})
+            tmp_path, monkeypatch, routing={"infrastructure": entry},
+            config=_BASELINE_CFG)
         _pack(root, "infrastructure")
         token = _bind(root, "infrastructure")
         try:
             p._recall("q")
         finally:
             runtime_cwd._SESSION_CWD.reset(token)
-        assert "tags" not in client.recall_calls[0]
+        _assert_baseline_kwargs(client.recall_calls[0])
 
     def test_blank_tags_keep_baseline(self, tmp_path, monkeypatch):
         p, client, root = _desktop_provider(
             tmp_path, monkeypatch,
-            routing={"infrastructure": {"extra_tags": ["  ", ""]}})
+            routing={"infrastructure": {"extra_tags": ["  ", ""]}},
+            config=_BASELINE_CFG)
         _pack(root, "infrastructure")
         token = _bind(root, "infrastructure")
         try:
             p._recall("q")
         finally:
             runtime_cwd._SESSION_CWD.reset(token)
-        assert "tags" not in client.recall_calls[0]
+        _assert_baseline_kwargs(client.recall_calls[0])
 
     def test_root_key_absent_branch_inert(self, tmp_path, monkeypatch):
+        # GENUINE absence (R5 residual 3b): config built with NO
+        # desktop_context_root key at all — a null value is a separate case.
         p, client, root = _desktop_provider(
             tmp_path, monkeypatch, routing=self.ROUTING,
-            config={"desktop_context_root": None})
+            config=_BASELINE_CFG, drop_keys=("desktop_context_root",))
         _pack(root, "infrastructure")
         token = _bind(root, "infrastructure")
         try:
             p._recall("q")
         finally:
             runtime_cwd._SESSION_CWD.reset(token)
-        assert "tags" not in client.recall_calls[0]
+        _assert_baseline_kwargs(client.recall_calls[0])
+
+    def test_root_key_null_value_branch_inert(self, tmp_path, monkeypatch):
+        # Null VALUE (key present, set to None) is also inert — kept as its
+        # own labeled case, distinct from genuine absence above.
+        p, client, root = _desktop_provider(
+            tmp_path, monkeypatch, routing=self.ROUTING,
+            config={**_BASELINE_CFG, "desktop_context_root": None})
+        _pack(root, "infrastructure")
+        token = _bind(root, "infrastructure")
+        try:
+            p._recall("q")
+        finally:
+            runtime_cwd._SESSION_CWD.reset(token)
+        _assert_baseline_kwargs(client.recall_calls[0])
 
     @pytest.mark.parametrize("raw", ["{not valid json", "[1, 2]", "null"])
     def test_malformed_non_object_routing_table(self, tmp_path, monkeypatch, raw):
-        p, client, root = _desktop_provider(tmp_path, monkeypatch, routing_raw=raw)
+        p, client, root = _desktop_provider(
+            tmp_path, monkeypatch, routing_raw=raw, config=_BASELINE_CFG)
         _pack(root, "infrastructure")
         token = _bind(root, "infrastructure")
         try:
             p._recall("q")
         finally:
             runtime_cwd._SESSION_CWD.reset(token)
-        assert "tags" not in client.recall_calls[0]
+        _assert_baseline_kwargs(client.recall_calls[0])
 
     def test_missing_routing_file(self, tmp_path, monkeypatch):
-        p, client, root = _desktop_provider(tmp_path, monkeypatch, routing=None)
+        p, client, root = _desktop_provider(
+            tmp_path, monkeypatch, routing=None, config=_BASELINE_CFG)
         _pack(root, "infrastructure")
         token = _bind(root, "infrastructure")
         try:
             p._recall("q")
         finally:
             runtime_cwd._SESSION_CWD.reset(token)
-        assert "tags" not in client.recall_calls[0]
+        _assert_baseline_kwargs(client.recall_calls[0])
 
     def test_dormant_domain_route_is_absent(self, tmp_path, monkeypatch):
         p, client, root = _desktop_provider(
             tmp_path, monkeypatch,
-            routing={"infrastructure": {"extra_tags": ["infrastructure"], "dormant": True}})
+            routing={"infrastructure": {"extra_tags": ["infrastructure"], "dormant": True}},
+            config=_BASELINE_CFG)
         _pack(root, "infrastructure")
         token = _bind(root, "infrastructure")
         try:
             p._recall("q")
         finally:
             runtime_cwd._SESSION_CWD.reset(token)
-        assert "tags" not in client.recall_calls[0]
+        _assert_baseline_kwargs(client.recall_calls[0])
 
     def test_symlink_boundary_across_root_edge(self, tmp_path, monkeypatch):
-        p, client, root = _desktop_provider(tmp_path, monkeypatch, routing=self.ROUTING)
+        # "escape-link" has an ACTIVE route in the table (R5 residual 3a):
+        # rejection must come from canonical resolve-based outside-root
+        # detection — if cwd.resolve() were dropped, the lexical path WOULD
+        # route and this test would fail.
+        p, client, root = _desktop_provider(
+            tmp_path, monkeypatch, routing=self.ROUTING, config=_BASELINE_CFG)
         _pack(root, "infrastructure")
         outside = tmp_path / "outside-real"
         outside.mkdir()
@@ -413,7 +487,7 @@ class TestFailOpenMatrix:
         finally:
             runtime_cwd._SESSION_CWD.reset(token)
         # Path.resolve() collapses the symlink: the cwd lands OUTSIDE the root.
-        assert "tags" not in client.recall_calls[0]
+        _assert_baseline_kwargs(client.recall_calls[0])
 
     def test_root_pointing_at_file_resolution_failure(self, tmp_path, monkeypatch):
         # Path-resolution failure: desktop_context_root points at a FILE, so no
@@ -422,14 +496,129 @@ class TestFailOpenMatrix:
         root_file.write_text("x")
         p, client, root = _desktop_provider(
             tmp_path, monkeypatch, routing=self.ROUTING,
-            config={"desktop_context_root": str(root_file)})
+            config={**_BASELINE_CFG, "desktop_context_root": str(root_file)})
         _pack(root, "infrastructure")
         token = _bind(root, "infrastructure")
         try:
             p._recall("q")
         finally:
             runtime_cwd._SESSION_CWD.reset(token)
-        assert "tags" not in client.recall_calls[0]
+        _assert_baseline_kwargs(client.recall_calls[0])
+
+
+# ---------------------------------------------------------------------------
+# §3.8.3a — cwd-resolution exception paths (R5 residual 1)
+# ---------------------------------------------------------------------------
+
+
+class TestCwdResolutionFailOpen:
+    ROUTING = {"infrastructure": {"extra_tags": ["infrastructure"]}}
+
+    def test_unresolvable_user_override_fails_open_to_baseline(self, tmp_path, monkeypatch, caplog):
+        # A bound ~user session override whose home cannot be resolved raises
+        # RuntimeError out of resolve_context_cwd() (§3.1): recall AND reflect
+        # must fail open to the configured baseline, not abort the call.
+        caplog.set_level(logging.DEBUG, logger="plugins.memory.hindsight")
+        p, client, root = _desktop_provider(
+            tmp_path, monkeypatch, routing=self.ROUTING, config=_BASELINE_CFG)
+        _pack(root, "infrastructure")
+        token = runtime_cwd.set_session_cwd("~hermes-nosuchuser-999/work")
+        try:
+            p._recall("q")
+            p._reflect("q")
+        finally:
+            runtime_cwd._SESSION_CWD.reset(token)
+        assert len(client.recall_calls) == 1
+        assert len(client.reflect_calls) == 1
+        _assert_baseline_kwargs(client.recall_calls[0])
+        _assert_baseline_kwargs(client.reflect_calls[0])
+        # Pin the EXCEPTION path (not the None-cwd path): the narrow
+        # (OSError, RuntimeError) guard fired and logged the concrete reason.
+        failures = [r for r in caplog.records
+                    if "context cwd resolution failed" in r.getMessage()]
+        assert failures, "resolver failure must hit the fail-open guard"
+        assert any("RuntimeError" in r.getMessage() for r in failures)
+
+    def test_terminal_policy_unavailable_refusal_propagates(self, tmp_path, monkeypatch):
+        # R5 boundary: an active refusal scope is a deliberate refusal, not a
+        # cwd-resolution failure — it must propagate past the narrow
+        # (OSError, RuntimeError) guard and never reach the backend.
+        from tools.terminal_scope import TerminalPolicyUnavailable
+
+        p, client, root = _desktop_provider(tmp_path, monkeypatch, routing=self.ROUTING)
+        _pack(root, "infrastructure")
+        token = _bind(root, "infrastructure")
+
+        def _refuse():
+            raise TerminalPolicyUnavailable("policy unreadable in this scope")
+
+        monkeypatch.setattr(runtime_cwd, "resolve_context_cwd", _refuse)
+        try:
+            with pytest.raises(TerminalPolicyUnavailable):
+                p._recall("q")
+        finally:
+            runtime_cwd._SESSION_CWD.reset(token)
+        assert client.recall_calls == []
+
+
+# ---------------------------------------------------------------------------
+# §3.4 — whole-list extra_tags validation (R5 residual 2)
+# ---------------------------------------------------------------------------
+
+
+class TestTagListValidation:
+    def test_blank_element_rejects_whole_list_both_entry_points(self, tmp_path, monkeypatch):
+        # One blank element invalidates the WHOLE list: never silently
+        # sanitized down to ["infrastructure"] — the baseline survives on
+        # BOTH entry points (§3.4).
+        p, client, root = _desktop_provider(
+            tmp_path, monkeypatch,
+            routing={"infrastructure": {"extra_tags": ["infrastructure", ""]}},
+            config=_BASELINE_CFG)
+        _pack(root, "infrastructure")
+        token = _bind(root, "infrastructure")
+        try:
+            p._recall("q")
+            p._reflect("q")
+        finally:
+            runtime_cwd._SESSION_CWD.reset(token)
+        _assert_baseline_kwargs(client.recall_calls[0])
+        _assert_baseline_kwargs(client.reflect_calls[0])
+
+    def test_non_str_element_entry_skipped_at_load(self, tmp_path, monkeypatch):
+        # The real loader rejects a non-str element by dropping the whole
+        # entry: the domain becomes unrouted -> baseline on both entry points.
+        p, client, root = _desktop_provider(
+            tmp_path, monkeypatch,
+            routing={"infrastructure": {"extra_tags": [123]}},
+            config=_BASELINE_CFG)
+        _pack(root, "infrastructure")
+        token = _bind(root, "infrastructure")
+        try:
+            p._recall("q")
+            p._reflect("q")
+        finally:
+            runtime_cwd._SESSION_CWD.reset(token)
+        _assert_baseline_kwargs(client.recall_calls[0])
+        _assert_baseline_kwargs(client.reflect_calls[0])
+
+    def test_nonblank_whitespace_tag_forwarded_verbatim(self, tmp_path, monkeypatch):
+        # A whitespace-wrapped tag is nonblank -> the route ACTIVATES and the
+        # string is forwarded VERBATIM on both entry points (no strip/rewrite).
+        p, client, root = _desktop_provider(
+            tmp_path, monkeypatch,
+            routing={"infrastructure": {"extra_tags": [" infrastructure "]}})
+        _pack(root, "infrastructure")
+        token = _bind(root, "infrastructure")
+        try:
+            p._recall("q")
+            p._reflect("q")
+        finally:
+            runtime_cwd._SESSION_CWD.reset(token)
+        assert client.recall_calls[0]["tags"] == [" infrastructure "]
+        assert client.recall_calls[0]["tags_match"] == "any_strict"
+        assert client.reflect_calls[0]["tags"] == [" infrastructure "]
+        assert client.reflect_calls[0]["tags_match"] == "any_strict"
 
 
 # ---------------------------------------------------------------------------
