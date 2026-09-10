@@ -1059,13 +1059,18 @@ class HindsightMemoryProvider(MemoryProvider):
         the configured ``desktop_context_root`` is set, the session cwd (session
         ContextVar override OR terminal-scope fallback, §3.1) resolves under
         ``root/<domain>/`` (``Path.resolve()`` + ``relative_to``; cwd == root or
-        outside root = no match), and that domain key's ``extra_tags`` is a
-        nonempty list of nonblank strings. Every other case — unrouted Discord/CLI
-        sessions, resolver None, outside root, cwd == root, unmatched or dormant
-        domain, empty/null/blank tags, missing/malformed table, root key absent —
-        returns the baseline unchanged (fail-open): the desktop branch never
-        REPLACES the baseline with an empty filter, which would drop both tags and
-        tags_match and cause unrestricted bank recall (R1-F2).
+        outside root = no match), and that domain key's ``extra_tags`` is — as a
+        WHOLE — a nonempty list of nonblank strings, forwarded verbatim (never
+        stripped, never sanitized to a subset). Every other case — unrouted
+        Discord/CLI sessions, resolver None, a resolver OSError/RuntimeError
+        (e.g. an unresolvable ``~user`` session override), outside root, cwd ==
+        root, unmatched or dormant domain, blank/non-str tag elements,
+        missing/malformed table, root key absent — returns the baseline unchanged
+        (fail-open): the desktop branch never REPLACES the baseline with an empty
+        filter, which would drop both tags and tags_match and cause unrestricted
+        bank recall (R1-F2). A TerminalPolicyUnavailable refusal from the
+        terminal scope is a deliberate refusal and deliberately propagates
+        (R5 boundary).
         """
         from agent.runtime_cwd import resolve_context_cwd
 
@@ -1074,10 +1079,19 @@ class HindsightMemoryProvider(MemoryProvider):
             # A platform:thread override already applied at initialize() — that
             # routing decision is authoritative; the domain branch must not shadow
             # it (§3.2: explicit, disjoint condition).
+            logger.debug(
+                "Hindsight desktop domain routing skipped (platform:thread "
+                "override already applied at initialize())"
+            )
             return baseline
         if self._platform != "desktop":
             # Single platform predicate (R3-1): every other platform keeps
-            # byte-identical baseline behavior, and no per-turn log noise.
+            # byte-identical baseline behavior (debug-only signal, no noise at
+            # default log levels).
+            logger.debug(
+                "Hindsight desktop domain routing skipped (platform=%s)",
+                self._platform,
+            )
             return baseline
         if not self._recall_sync:
             # §3.8.6 defensive close: buffered async prefetch results cannot be
@@ -1092,8 +1106,25 @@ class HindsightMemoryProvider(MemoryProvider):
             return baseline
         root_raw = (self._config or {}).get("desktop_context_root")
         if not root_raw:
-            return baseline  # config key absent -> branch inert (§3.4)
-        cwd = resolve_context_cwd()
+            # config key absent (or null) -> branch inert (§3.4)
+            logger.debug(
+                "Hindsight desktop domain routing: desktop_context_root absent "
+                "-> global filter"
+            )
+            return baseline
+        try:
+            cwd = resolve_context_cwd()
+        except (OSError, RuntimeError) as exc:
+            # Unresolvable ~user session override or traversal failure (§3.1):
+            # fail open to the baseline. Deliberately NARROW — a
+            # TerminalPolicyUnavailable refusal (active terminal scope) is a
+            # refusal, not a resolution failure, and propagates (R5 boundary).
+            logger.debug(
+                "Hindsight desktop domain routing: context cwd resolution failed "
+                "(%s: %s) -> global filter",
+                type(exc).__name__, exc,
+            )
+            return baseline
         if not cwd:
             logger.debug("Hindsight desktop domain routing: no context cwd resolved -> global filter")
             return baseline
@@ -1108,25 +1139,30 @@ class HindsightMemoryProvider(MemoryProvider):
                          str(cwd), root_raw, exc)
             return baseline
         if not domain:
-            return baseline  # cwd == root -> no domain component
+            # cwd == root -> no domain component
+            logger.debug(
+                "Hindsight desktop domain routing: cwd == root -> global filter")
+            return baseline
         entry = self._thread_routing_table.get(domain)
         if entry is None:
             logger.debug("Hindsight desktop domain routing: no active route for domain %r", domain)
             return baseline
         extra = entry.get("extra_tags") if isinstance(entry, dict) else None
-        usable = [str(t).strip() for t in extra if isinstance(t, str)] if isinstance(extra, list) else []
-        usable = [t for t in usable if t]
-        if not usable:
-            # Empty/null/blank tags must NOT become the filter (unrestricted bank
-            # recall, worse than the bug being fixed): keep the baseline (R1-F2).
-            logger.debug("Hindsight desktop domain routing: domain %r has no usable tags -> baseline", domain)
+        if (not isinstance(extra, list) or not extra
+                or not all(isinstance(t, str) and t.strip() for t in extra)):
+            # §3.4: extra_tags must BE a nonempty list of nonblank strings.
+            # Any deviation — blank or non-str element, empty list — yields the
+            # baseline; never a sanitized subset, never a stripped rewrite.
+            logger.debug(
+                "Hindsight desktop domain routing: domain %r extra_tags is not a "
+                "nonempty list of nonblank strings -> baseline", domain)
             return baseline
         logger.info(
             "Hindsight desktop domain-routing override active: key=%s domain=%s "
             "tags=%s tags_match=any_strict",
-            domain, domain, usable,
+            domain, domain, extra,
         )
-        return usable, "any_strict"
+        return extra, "any_strict"
 
     def _recall(self, query: str) -> list:
         tags, tags_match = self._effective_recall_filter()
