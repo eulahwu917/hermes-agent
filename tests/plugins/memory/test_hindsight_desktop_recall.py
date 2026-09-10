@@ -227,18 +227,20 @@ class TestOutgoingFilterDomain:
 
     def test_reflect_empty_bank_positive_control(self, tmp_path, monkeypatch):
         # Mirror of the recall empty-bank control for the _reflect entry point
-        # (§3.8.1): zero hits must still CALL the backend once with the domain
-        # filter and succeed — distinct from the timeout/error path, which
-        # raises and records no success signal.
+        # (§3.8.1): with the backend's reflect response configured EMPTY, the
+        # entry point must still CALL the backend once with the domain filter
+        # and return the empty result without error — distinct from the
+        # timeout/error path, which raises and records no success signal.
         p, client, root = _desktop_provider(
-            tmp_path, monkeypatch, routing=self.ROUTING, results=[])
+            tmp_path, monkeypatch, routing=self.ROUTING, results=[],
+            reflect_text="")
         _pack(root, "infrastructure")
         token = _bind(root, "infrastructure")
         try:
             out = p._reflect("anything")
         finally:
             runtime_cwd._SESSION_CWD.reset(token)
-        assert out == "synthesized"
+        assert out == ""
         assert len(client.reflect_calls) == 1
         assert client.reflect_calls[0]["tags"] == ["infrastructure"]
         assert client.reflect_calls[0]["tags_match"] == "any_strict"
@@ -398,9 +400,11 @@ class TestFailOpenMatrix:
         token = _bind(root, "infrastructure")
         try:
             p._recall("q")
+            p._reflect("q")
         finally:
             runtime_cwd._SESSION_CWD.reset(token)
         _assert_baseline_kwargs(client.recall_calls[0])
+        _assert_baseline_kwargs(client.reflect_calls[0])
 
     def test_root_key_absent_branch_inert(self, tmp_path, monkeypatch):
         # GENUINE absence (R5 residual 3b): config built with NO
