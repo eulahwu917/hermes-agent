@@ -1917,6 +1917,60 @@ def _current_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
     return int(row["current_run_id"]) if row and row["current_run_id"] else None
 
 
+def read_worker_run_state(
+    task_id: str, run_id: int, *, board: Optional[str] = None,
+) -> "tuple[Optional[str], Optional[int]]":
+    """Side-effect-free peek at a worker run's ``(outcome, current_run_id)``.
+
+    Serves the agent turn-end kanban exit guard, which must know whether a
+    dispatcher-spawned worker whose session never called a terminal tool still
+    owns an unfinished run — without turning a policy check into a board write.
+    A run that already reached a terminal outcome (``review_requested`` /
+    ``changes_requested`` / ``completed`` / ...) or a card whose
+    ``current_run_id`` differs from the worker's run is finished, not a
+    protocol-violation risk.
+
+    NEVER creates or initializes the board: missing / zero-byte DB files and
+    every open/read error return ``(None, None)`` ("cannot determine"), and the
+    connection is opened ``mode=ro`` so a WAL board is read without acquiring
+    any write lock or mutating sidecars. ``(None, None)`` is the failure
+    sentinel; the two fields are independently nullable when a real row was
+    read (``outcome=None`` = run still open; ``current_run_id=None`` = nobody
+    currently owns the card).
+    """
+    try:
+        path = kanban_db_path(board=board)
+        if not path.is_file() or path.stat().st_size == 0:
+            return None, None
+        uri = f"{path.resolve().as_uri()}?mode=ro"
+    except (OSError, RuntimeError):
+        return None, None
+    conn = None
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+        row = conn.execute(
+            "SELECT r.outcome, t.current_run_id "
+            "FROM task_runs r "
+            "LEFT JOIN tasks t ON t.id = r.task_id "
+            "WHERE r.id = ? AND r.task_id = ?",
+            (int(run_id), task_id),
+        ).fetchone()
+    except (sqlite3.Error, ValueError):
+        return None, None
+    finally:
+        if conn is not None:
+            with contextlib.suppress(Exception):
+                conn.close()
+    if row is None:
+        return None, None
+    outcome: Optional[str] = row[0] if row[0] is not None else None
+    try:
+        current = int(row[1]) if row[1] is not None else None
+    except (TypeError, ValueError):
+        current = None
+    return outcome, current
+
+
 def _end_or_synthesize_run(
     conn: sqlite3.Connection, task_id: str, *, outcome: str, status: str,
     summary: Optional[str] = None, metadata: Optional[dict] = None, synthesize: bool,
