@@ -995,14 +995,6 @@ def _auth_diff_text():
     return committed + "\n" + worktree
 
 
-def _changed_files():
-    base = _diff_base()
-    changed = _git("diff", "--name-only", base).stdout.split()
-    changed += _git("diff", "--name-only", base, "HEAD").stdout.split()
-    changed += _git("ls-files", "--others", "--exclude-standard").stdout.split()
-    return {f for f in changed if f}
-
-
 def test_t15_negative_greps():
     """No provenance parameter and no id_token usage in the codex paths."""
     diff = _auth_diff_text()
@@ -1045,33 +1037,28 @@ def _auth_symbol_maps():
 
 
 def test_t18_dual_enumeration_budget_pin():
-    """R17'prod/§SB: EXACT production-symbol + non-production-file budgets.
+    """R17'prod/§SB: EXACT production-symbol budget.
 
     Structural, not heuristic: parse BOTH versions of hermes_cli/auth.py with
     ``ast`` and compare their top-level symbol trees exactly. Any added,
     removed, or modified production symbol outside the §SB enumeration fails —
     including symbol kinds regex-on-diff hunks would miss (classes, imports,
     ann-assigns, mid-file inserts).
-    """
-    changed = _changed_files()
 
-    allowed_nonprod = {
-        "CHANGELOG.md",
-        "tests/agent/test_codex_singleton_write_through.py",
-    }
-    # Multi-patch deployments (e.g. LOCAL_PATCHES.md carriers): files carried by
-    # OTHER, unrelated patches must be declared via HERMES_T18_EXTRA_NONPROD
-    # (comma-separated paths) so this pin stays byte-exact for the OAuth patch
-    # itself while tolerating sibling patches. Unset => upstream-strict mode.
-    extra = {
-        p.strip() for p in
-        os.environ.get("HERMES_T18_EXTRA_NONPROD", "").split(",") if p.strip()
-    }
-    allowed_nonprod |= extra
-    nonprod = {f for f in changed if f != "hermes_cli/auth_codex.py"}
-    assert nonprod == allowed_nonprod, (
-        f"non-production files must EXACTLY equal {sorted(allowed_nonprod)}; got {sorted(nonprod)}"
-    )
+    The former whole-branch non-production FILE-set pin is retired (see below):
+    it froze the branch-wide changed-file set, which is a change-detector on a
+    multi-patch carried branch (upstream AGENTS.md bans those).
+    """
+    # R17'prod file-set pin RETIRED (2026-09-13 re-home): asserting the whole-branch
+    # changed-file set EXACTLY equals {CHANGELOG.md, this test} is a change-detector —
+    # on a multi-patch carried branch (LOCAL_PATCHES.md) it freezes the UNION of
+    # unrelated patches, and the only "fix" was re-declaring that snapshot via
+    # HERMES_T18_EXTRA_NONPROD (a hidden change-detector). The §SB intent — the OAuth
+    # patch's production footprint is exactly hermes_cli/auth_codex.py — remains fully
+    # guarded below by AST enumeration of that file's top-level symbols
+    # (added/removed/changed-bodies), which asserts a contract between merge-base and
+    # HEAD rather than a frozen file list. Production-file discipline beyond that file
+    # is review's job on a combined branch.
 
     base_syms, head_syms = _auth_symbol_maps()
     added = set(head_syms) - set(base_syms)
