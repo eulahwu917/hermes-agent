@@ -1714,16 +1714,15 @@ def create_job(
     delivered verbatim, requires ``script``). context_from: job id(s) whose latest output is
     injected. workdir: absolute cwd for tools/scripts. monitor_script/monitor_url: cheap monitor
     source run FIRST each tick; unchanged output suppresses the agent run (mutually exclusive,
-    incompatible with ``no_agent``). reasoning_effort: per-job pin; capability NOT validated."""
+    incompatible with ``no_agent``). reasoning_effort: per-job pin; capability NOT validated.
+    alarm: for ``no_agent`` jobs, nonempty stdout is recorded as a failure incident
+    REGARDLESS of exit code (exit-0 alarm producers like health checks)."""
     if not isinstance(paused, bool):
         raise ValueError("paused must be a boolean.")
     if paused_reason is not None and not isinstance(paused_reason, str):
         raise ValueError("paused_reason must be a string.")
     if paused_reason is not None and not paused:
         raise ValueError("paused_reason requires paused=True.")
-    incompatible with ``no_agent``). reasoning_effort: per-job pin; capability NOT validated.
-    alarm: for ``no_agent`` jobs, nonempty stdout is recorded as a failure incident
-    REGARDLESS of exit code (exit-0 alarm producers like health checks)."""
     parsed_schedule = parse_schedule(schedule)
     # Normalize repeat: treat 0 or negative values as None (infinite). String forms
     # ('forever'/'once'/numeric) coerce via normalize_repeat_value — the shared chokepoint with update paths
