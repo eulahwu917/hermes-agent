@@ -50,6 +50,15 @@ carrying before you start.
   `/srv/personal/scratch/hermes-agent-pre-update-20260906.bundle` (534MB full bundle).
 - Config migrated 38 → 41 (`hermes config migrate`); update-check caches cleared.
 
+## 2026-09-13 re-home notes (recovery from the accidental v0.21.2 update)
+
+Four semantic defects were re-verified after the replay; these notes record the mechanics for the next re-home:
+
+- **Attention ledger plumbing (`cron/attention.py`):** v0.21.2 deleted `ledger_transaction`/`open_ledger`/`prepare_ledger` from `cron.executions` (the shared SQLite stack moved to `hermes_cli.sqlite_util`). Re-homed exactly like `cron.incidents`: `open_db(..., initialize=_initialize_schema)` + `transaction()` under the module lock; the schema hook now delegates to `cron.executions._initialize_schema` + `cron.incidents._initialize_schema` (both idempotent) before creating the attention tables.
+- **Hindsight pins:** the hard `hindsight-client` 0.8.5 bumps in `pyproject.toml` / `tools/lazy_deps.py` / `plugin.yaml` were reverted to upstream's 0.6.1 — with lazy installs disabled (this deployment), `ensure()` hard-raised at client construction and regressed three upstream tests. The floor is correctly enforced by `_MIN_CLIENT_VERSION` (0.8.5) via `_maybe_upgrade_client()` (best-effort upgrade) plus the C4 recall-param guard.
+- **min_scores wiring tests:** `test_prefetch_passes_min_scores_when_configured` and `test_hindsight_recall_tool_passes_min_scores` now pin `importlib.metadata.version` to 0.8.5 (the same pattern the prefer_observations tests already used) so they assert the config wiring rather than the ambient venv's `hindsight-client`.
+- **T18 file-set pin retired:** the whole-branch non-production file-set assertion is a change-detector on this multi-patch carried branch (upstream AGENTS.md ban). The §SB symbol enumeration on `hermes_cli/auth_codex.py` (added/removed/changed-bodies) is unchanged; the `HERMES_T18_EXTRA_NONPROD` runtime declaration is no longer needed for T18.
+
 ## Retired (for history — merged upstream, no longer carried)
 
 _(none yet)_
