@@ -106,7 +106,17 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
 
     # ─── Memory providers ──────────────────────────────────────────────────
     "memory.honcho": ("honcho-ai==2.2.0",),
-    "memory.hindsight": ("hindsight-client==0.6.1",),
+    # Ranged floor, NOT an exact pin (deliberate carried exception — see
+    # LOCAL_PATCHES.md "Hindsight pins"). Our recall-param floor needs
+    # hindsight-client >= 0.8.4 (plugins/memory/hindsight: `_MIN_CLIENT_VERSION`
+    # 0.8.5 + the C4 guard), while a legacy 0.6.1 host must still construct a
+    # client with the floor cleanly disabled. An exact pin cannot satisfy both:
+    # `==0.8.5` hard-raises on a 0.6.1 host (lazy installs disabled), and
+    # `==0.6.1` makes ensure() treat an installed 0.8.5 as "missing" and
+    # reinstall/downgrade it, undoing `_maybe_upgrade_client()`. A tolerant
+    # floor admits every supported 0.x >= 0.6.1 (including 0.8.x) with no
+    # downgrade; feature availability stays gated by the C4 guard, not the pin.
+    "memory.hindsight": ("hindsight-client>=0.6.1,<1",),
     # Cloud memory SDKs MUST be allowlisted + ensure()'d at the import site, or they never
     # install on the sealed Docker image (durable-target only).
     "memory.supermemory": ("supermemory==3.50.0",),

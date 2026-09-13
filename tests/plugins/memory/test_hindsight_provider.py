@@ -1937,3 +1937,135 @@ class TestPreferObservations:
         assert "prefer_observations" not in kwargs
         assert "min_scores" not in kwargs
         assert any("require hindsight-client >= 0.8.4" in rec.message for rec in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# Client acquisition policy matrix (regression for the F1 gate finding)
+#
+# The lazy-dep exact pin `hindsight-client==0.6.1` contradicted the carried
+# recall-param floor (`_MIN_CLIENT_VERSION` 0.8.5 + the C4 >=0.8.4 guard):
+# an installed 0.8.5 failed `ensure()` (hard raise under disabled installs, or
+# downgrade-then-disable under enabled installs), while 0.6.1 constructed with
+# the floor silently inert. The pin is now a tolerant ranged floor
+# (`>=0.6.1,<1`) and these tests drive the REAL `ensure()` acquisition path —
+# no preseeded `p._client` — with a faked installed version and a stubbed
+# installer, proving acquisition, floor state, and the absence of a downgrade.
+# ---------------------------------------------------------------------------
+
+
+class TestClientAcquisitionPolicyMatrix:
+    def _acquire(self, tmp_path, monkeypatch, installed, lazy_enabled):
+        import builtins
+        import importlib.metadata as md
+
+        import tools.lazy_deps as ld
+
+        config = {
+            "mode": "cloud",
+            "apiKey": "test-key",
+            "api_url": "http://localhost:9999",
+            "bank_id": "test-bank",
+            "budget": "mid",
+            "memory_mode": "hybrid",
+            "recall_min_scores": {"reranker": 0.01},
+        }
+        config_path = tmp_path / "hindsight" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(config))
+
+        monkeypatch.setattr(
+            "plugins.memory.hindsight.get_hermes_home", lambda: tmp_path
+        )
+
+        # The acquisition gate decides satisfaction off the installed version;
+        # fake it so the test is independent of whatever SDK sits in the venv.
+        monkeypatch.setattr(md, "version", lambda name: installed)
+
+        # Record any install the real ensure()/install_specs() path executes.
+        # A downgrade would show up here; a satisfied acquire must not.
+        installed_specs = []
+        monkeypatch.setattr(
+            ld,
+            "_venv_pip_install",
+            lambda specs, **kw: installed_specs.append(tuple(specs))
+            or ld._InstallResult(True, "", ""),
+        )
+        monkeypatch.setattr(ld, "_allow_lazy_installs", lambda: lazy_enabled)
+
+        # Provide `hindsight_client` without touching the network/SDK; capture
+        # what the cloud client constructor was handed so the tests can prove a
+        # real client was built through `_new_cloud_client`.
+        constructed = []
+
+        class FakeHindsight:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                constructed.append(kwargs)
+
+        real_import = builtins.__import__
+
+        def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "hindsight_client":
+                return SimpleNamespace(Hindsight=FakeHindsight)
+            return real_import(name, globals, locals, fromlist, level)
+
+        monkeypatch.setattr(builtins, "__import__", guarded_import)
+
+        p = HindsightMemoryProvider()
+        p.initialize(session_id="test", hermes_home=str(tmp_path), platform="cli")
+        p._get_client()  # real ensure() acquisition path (NOT a preseeded client)
+        return p, constructed, installed_specs
+
+    def test_supported_client_acquires_with_floor_enabled_when_installs_disabled(
+        self, tmp_path, monkeypatch
+    ):
+        # >=0.8.4 client + lazy installs disabled → constructs AND floor enabled.
+        p, constructed, installed_specs = self._acquire(
+            tmp_path, monkeypatch, "0.8.5", False
+        )
+
+        assert constructed[0]["base_url"] == "http://localhost:9999"
+        assert installed_specs == []  # 0.8.5 already satisfies the ranged floor
+        # C4 guard must NOT have knocked the recall floor out.
+        assert p._recall_min_scores == {"reranker": 0.01}
+
+    def test_legacy_client_acquires_with_floor_disabled_and_no_hard_raise(
+        self, tmp_path, monkeypatch
+    ):
+        # Legacy 0.6.1 (retained) + installs disabled → constructs, floor dropped
+        # cleanly by the C4 guard, no ImportError/FeatureUnavailable hard raise.
+        p, constructed, installed_specs = self._acquire(
+            tmp_path, monkeypatch, "0.6.1", False
+        )
+
+        assert constructed[0]["base_url"] == "http://localhost:9999"
+        assert installed_specs == []  # upgrade was gated off, acquire was a no-op
+        assert p._recall_min_scores is None  # C4 guard disabled the floor below 0.8.4
+
+    def test_supported_client_no_downgrade_when_installs_enabled(
+        self, tmp_path, monkeypatch
+    ):
+        # 0.8.5 + installs enabled → acquire must not reinstall/downgrade it.
+        p, constructed, installed_specs = self._acquire(
+            tmp_path, monkeypatch, "0.8.5", True
+        )
+
+        assert constructed[0]["base_url"] == "http://localhost:9999"
+        assert installed_specs == []  # no downgrade spec was ever installed
+        assert p._recall_min_scores == {"reranker": 0.01}
+
+    def test_legacy_upgrade_never_followed_by_downgrade_when_installs_enabled(
+        self, tmp_path, monkeypatch
+    ):
+        # Legacy 0.6.1 + installs enabled: _maybe_upgrade_client() requests the
+        # floor once, and the acquire path must NOT then reinstall the pin back
+        # down — the contradictory upgrade-then-downgrade sequence the gate flagged.
+        from plugins.memory.hindsight import _MIN_CLIENT_VERSION
+
+        p, constructed, installed_specs = self._acquire(
+            tmp_path, monkeypatch, "0.6.1", True
+        )
+
+        assert constructed[0]["base_url"] == "http://localhost:9999"
+        assert installed_specs == [(f"hindsight-client>={_MIN_CLIENT_VERSION}",)]
+        assert not any("0.6.1" in spec for specs in installed_specs for spec in specs)
