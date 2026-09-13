@@ -1801,7 +1801,12 @@ class TestRecallMinScores:
     """Verify recall_min_scores reaches arecall at both call sites and that
     malformed config is dropped (fail-open)."""
 
-    def test_prefetch_passes_min_scores_when_configured(self, provider_with_config):
+    def test_prefetch_passes_min_scores_when_configured(self, provider_with_config,
+                                                        monkeypatch):
+        # The C4 version guard disables the floor below hindsight-client 0.8.4; pin the
+        # client version (as TestPreferObservations does) so this test asserts the
+        # config wiring — not the ambient venv's installed client.
+        monkeypatch.setattr("importlib.metadata.version", lambda _: "0.8.5")
         p = provider_with_config(recall_min_scores={"reranker": 0.01})
         p.queue_prefetch("test query")
         if p._prefetch_thread:
@@ -1819,7 +1824,11 @@ class TestRecallMinScores:
         call_kwargs = p._client.arecall.call_args.kwargs
         assert "min_scores" not in call_kwargs
 
-    def test_hindsight_recall_tool_passes_min_scores(self, provider_with_config):
+    def test_hindsight_recall_tool_passes_min_scores(self, provider_with_config,
+                                                     monkeypatch):
+        # Same reason as test_prefetch_passes_min_scores_when_configured: pin the client
+        # version above the C4 guard threshold so the wiring assertion is deterministic.
+        monkeypatch.setattr("importlib.metadata.version", lambda _: "0.8.5")
         p = provider_with_config(recall_min_scores={"reranker": 0.02, "final": 0.1})
         p.handle_tool_call("hindsight_recall", {"query": "test"})
         call_kwargs = p._client.arecall.call_args.kwargs
