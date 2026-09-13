@@ -28,7 +28,6 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
 from cron import executions as _executions
-from cron.executions import ledger_transaction, open_ledger, prepare_ledger
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
 
@@ -69,15 +68,28 @@ def _db_path() -> Path:
 
 
 def _connect() -> sqlite3.Connection:
-    return open_ledger(_db_path())
+    # Late imports, same guarantee as cron.executions._connect / cron.incidents._connect:
+    # a scheduler daemon that outlives an on-disk upgrade keeps old modules cached, so
+    # connection helpers are resolved at call time (0.21.2 moved the shared SQLite stack
+    # to hermes_cli.sqlite_util and dropped the ledger helpers this module used to import).
+    from cron.jobs import _ensure_cron_dir
+    from hermes_cli.sqlite_util import open_db
+
+    path = _db_path()
+    _ensure_cron_dir(path.parent)
+    return open_db(path, db_label="cron/executions.db", synchronous_full=True,
+                   initialize=_initialize_schema)
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
-    prepare_ledger(conn, db_label="cron/executions.db")
-    # The unified read selects from cron_incidents too; ensure it exists even on a fresh
-    # DB no incident write has initialized yet (incidents' DDL is idempotent).
+    # The shared executions.db carries the executions + incidents tables too; each
+    # module's DDL is idempotent, so one open initializes all three schemas. The unified
+    # read selects from cron_incidents even on a fresh DB no incident write has
+    # initialized yet (incidents' DDL is idempotent).
+    from cron.executions import _initialize_schema as _executions_schema
     from cron.incidents import _initialize_schema as _incidents_schema
 
+    _executions_schema(conn)
     _incidents_schema(conn)
     conn.execute(
         """CREATE TABLE IF NOT EXISTS attention_events (
@@ -110,7 +122,9 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
 
 @contextmanager
 def _transaction() -> Iterator[sqlite3.Connection]:
-    with ledger_transaction(_lock, _connect, _initialize_schema) as conn:
+    from hermes_cli.sqlite_util import transaction
+
+    with _lock, transaction(_connect()) as conn:
         yield conn
 
 
