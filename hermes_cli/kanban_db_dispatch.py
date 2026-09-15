@@ -81,12 +81,6 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
 # a success; this is the same idea for a reviewer verdict.
 _REWORK_RUN_OUTCOMES = ("changes_requested",)
 
-# Slack allowed between the reviewer's verdict comment and the run it closes. The
-# two are written a moment apart (sometimes comment-first, sometimes event-first),
-# so the escape tolerates this much jitter — but a PR-URL comment arriving later
-# than this is treated as new information and the guard applies again.
-_REWORK_VERDICT_TOLERANCE_SECONDS = 600
-
 
 @dataclass
 class DispatchResult:
@@ -1143,18 +1137,23 @@ def _in_rework_cycle(conn: sqlite3.Connection, task_id: str) -> bool:
 
     ``kanban_request_changes`` closes the reviewer's run with outcome
     ``changes_requested`` and requeues the card to the original implementer. That
-    rework is pushed to the SAME branch and PR, so it is not the "repeat worker
-    storm" the respawn guard exists to block (upstream 264e85b3dd) — the guard's
-    own review lane is exempt for the same reason, and guard 3 already exempts a
-    deliberate re-queue after a success.
+    rework is pushed to the SAME branch and PR, so the verdict's own citation of
+    that PR is not the duplicate-PR / "repeat worker storm" signal the respawn
+    guard exists to block (upstream ``264e85b3dd``; and upstream ``a235d1917e``
+    already exempts the review lane on exactly this reasoning — a PR URL is often
+    the *input* to the next step, not evidence of duplicate work).
 
-    Bounded on purpose, so this cannot become a blanket bypass: the card must be
-    in a rework cycle *and* the rework verdict must be the most recent thing said
-    about the PR. If a PR-URL comment arrives after the verdict — e.g. somebody
-    opened a SECOND pull request while the card sat here — the verdict is no longer
-    the newest PR word, this returns False, and guard 4 applies as before. The
-    tolerance absorbs only the sub-second ordering jitter between the verdict
-    comment and the run it closes.
+    Decided on PR **identity**, never on timing: the exemption holds only while
+    every PR mentioned on the card was already known *before* the verdict was
+    written (``created_at < verdict_at``). The verdict re-citing that same PR is
+    therefore tolerated however the comment/run write ordering fell, while a
+    **different** pull request — a second PR opened while the card sat in rework —
+    re-arms guard 4 immediately, at any offset, including at the verdict's own
+    timestamp.
+
+    Fail-closed: if the PR appears *only* in the verdict comment and nowhere
+    earlier, the set test cannot be satisfied and the card keeps the ordinary 24h
+    deferral rather than gaining an exemption on an unverifiable premise.
     """
     latest = conn.execute(
         "SELECT outcome, ended_at FROM task_runs "
@@ -1166,18 +1165,23 @@ def _in_rework_cycle(conn: sqlite3.Connection, task_id: str) -> bool:
         return False
     verdict_at = int(latest["ended_at"] or 0)
 
-    newest_pr_at = None
+    known_at_verdict = set()
+    seen = set()
     for c in conn.execute(
         "SELECT body, created_at FROM task_comments "
         "WHERE task_id = ? AND created_at >= ?",
-        (task_id, verdict_at - _REWORK_VERDICT_TOLERANCE_SECONDS),
+        (task_id, verdict_at - _RESPAWN_GUARD_PR_WINDOW),
     ).fetchall():
-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
-            newest_pr_at = max(newest_pr_at or 0, int(c["created_at"] or 0))
-    if newest_pr_at is None:
-        # No PR mentioned in the window: guard 4 cannot fire, so the cycle question is moot.
+        urls = set(_RESPAWN_GUARD_PR_URL_RE.findall(c["body"] or ""))
+        if not urls:
+            continue
+        seen |= urls
+        if int(c["created_at"] or 0) < verdict_at:
+            known_at_verdict |= urls
+    if not seen:
+        # No PR is mentioned in the window: guard 4 cannot fire either way.
         return True
-    return newest_pr_at <= verdict_at + _REWORK_VERDICT_TOLERANCE_SECONDS
+    return seen <= known_at_verdict
 
 
 def check_respawn_guard(

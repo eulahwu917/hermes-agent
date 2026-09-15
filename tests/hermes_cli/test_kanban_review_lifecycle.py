@@ -498,64 +498,84 @@ def test_active_pr_guard_released_when_card_is_mid_rework(
         lambda *a, **k: {"kanban": {"review_dispatch": True}},
     )
     pr_url = "https://github.com/example/repo/pull/7"
+    other_url = "https://github.com/example/repo/pull/8"
+    _now = int(__import__("time").time())
 
-    with kbc.connect() as conn:
-        # Place the card in the mid-rework state a verdict produces: the run that
-        # ended is the reviewer's, with outcome ``changes_requested``, and the
-        # verdict comment carries the PR URL (provenance, as verdicts do).
-        tid = kb.create_task(conn, title="rework me", assignee="worker")
-        _now = int(__import__("time").time())
+    def _rework_card(conn, title, *, pr_before=None, pr_after=None, verdict_cites=True):
+        """Build a card sitting in the mid-rework state (or a plain PR card when
+        ``verdict_cites``/run state are omitted by the caller)."""
+        tid = kb.create_task(conn, title=title, assignee="worker")
         with kb.write_txn(conn):
+            if pr_before:
+                conn.execute(
+                    "INSERT INTO task_comments (task_id, author, body, created_at) "
+                    "VALUES (?, 'worker', ?, ?)",
+                    (tid, f"Opened {pr_before} for review.", _now - 120),
+                )
             conn.execute(
                 "INSERT INTO task_runs (task_id, profile, status, outcome, "
                 "started_at, ended_at) VALUES (?, 'reviewer', 'done', "
                 "'changes_requested', ?, ?)",
                 (tid, _now - 5, _now),
             )
-        kb.add_comment(
-            conn, tid, author="reviewer",
-            body=f"NOT_APPROVED at {pr_url} — changes requested.",
-        )
-        latest = conn.execute(
-            "SELECT outcome FROM task_runs WHERE task_id = ? "
-            "ORDER BY ended_at DESC LIMIT 1", (tid,),
-        ).fetchone()
-        assert latest["outcome"] == "changes_requested"
+            if verdict_cites:
+                conn.execute(
+                    "INSERT INTO task_comments (task_id, author, body, created_at) "
+                    "VALUES (?, 'reviewer', ?, ?)",
+                    (tid, f"NOT_APPROVED at {pr_url} — changes requested.", _now),
+                )
+            if pr_after is not None:
+                url, offset, author = pr_after
+                conn.execute(
+                    "INSERT INTO task_comments (task_id, author, body, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (tid, author, f"opened another {url}", _now + offset),
+                )
+        return tid
 
-        # Released: the rework round may spawn even though the verdict cites the PR.
+    with kbc.connect() as conn:
+        # 1. The real case: the implementer cited the PR, then the verdict re-cites
+        #    the SAME PR. Released — however the comment/run ordering fell — and it
+        #    must dispatch.
+        tid = _rework_card(conn, "rework me (same PR)", pr_before=pr_url)
         assert kbd.check_respawn_guard(conn, tid) is None
         res = kbd.dispatch_once(conn, dry_run=True)
         assert tid in [s[0] for s in res.spawned]
+        # State-based, not a countdown: a second evaluation says the same thing.
+        assert kbd.check_respawn_guard(conn, tid) is None
 
-        # Control: the same PR-URL comment with NO rework verdict still defers.
+        # 2. Control: a PR-URL comment with NO rework verdict still defers.
         ctrl = kb.create_task(conn, title="already PRed, no verdict", assignee="worker")
         kb.add_comment(conn, ctrl, author="worker", body=f"Opened {pr_url} for review.")
         assert kbd.check_respawn_guard(conn, ctrl) == "active_pr"
 
-        # NEW PR word AFTER the verdict — a second pull request opened while the
-        # card sat in rework — must re-arm the guard. The escape is a bounded
-        # exemption for the verdict that cites the PR, not a blanket bypass.
-        later = kb.create_task(conn, title="second PR after verdict", assignee="worker")
-        _t = int(__import__("time").time())
-        with kb.write_txn(conn):
-            conn.execute(
-                "INSERT INTO task_runs (task_id, profile, status, outcome, "
-                "started_at, ended_at) VALUES (?, 'reviewer', 'done', "
-                "'changes_requested', ?, ?)",
-                (later, _t - 5, _t),
-            )
-            conn.execute(
-                "INSERT INTO task_comments (task_id, author, body, created_at) "
-                "VALUES (?, 'reviewer', ?, ?)",
-                (later, f"NOT_APPROVED at {pr_url} — changes requested.", _t),
-            )
-            # ...and an hour later, a SECOND PR link.
-            conn.execute(
-                "INSERT INTO task_comments (task_id, author, body, created_at) "
-                "VALUES (?, 'worker', ?, ?)",
-                (later, "opened a second one https://github.com/example/repo/pull/8", _t + 3600),
-            )
+        # 3. A DIFFERENT PR, posted inside the first minutes (the gate's finding 1
+        #    counterexample: +300s, different author) must re-arm guard 4.
+        inside = _rework_card(
+            conn, "second PR inside slack",
+            pr_before=pr_url, pr_after=(other_url, 300, "developer"),
+        )
+        assert kbd.check_respawn_guard(conn, inside) == "active_pr"
+        assert kbd.check_respawn_guard(conn, inside) == "active_pr"  # and on a later tick
+
+        # 4. Boundary-ish: a different PR at the same moment as the verdict.
+        at_verdict = _rework_card(
+            conn, "second PR at verdict offset",
+            pr_before=pr_url, pr_after=(other_url, 0, "developer"),
+        )
+        assert kbd.check_respawn_guard(conn, at_verdict) == "active_pr"
+
+        # 5. A different PR an hour later (the original control — still defers).
+        later = _rework_card(
+            conn, "second PR after verdict",
+            pr_before=pr_url, pr_after=(other_url, 3600, "developer"),
+        )
         assert kbd.check_respawn_guard(conn, later) == "active_pr"
+
+        # 6. Fail-closed: the PR is cited ONLY by the verdict, nowhere earlier, so
+        #    the same-PR premise is unverifiable — keep the ordinary 24h deferral.
+        verdict_only = _rework_card(conn, "verdict is the only citation", pr_before=None)
+        assert kbd.check_respawn_guard(conn, verdict_only) == "active_pr"
 
 
 def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
