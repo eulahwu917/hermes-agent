@@ -285,12 +285,22 @@ class TestSkillManageBatch(unittest.TestCase):
         from tools import skill_ledger as _ledger
 
         self._call("probe", [{"action": "create", "content": SK.format(n="probe")}])
+        real_capture = _ledger.snapshot_paths
+        calls = []
+
+        def _first_real_then_fail(root):
+            calls.append(root)
+            if len(calls) == 1:
+                return real_capture(root)      # genuine pre-restore manifest
+            raise OSError("disk full")          # second (post-restore) capture fails
+
         with mock.patch("tools.skill_manager_batch._rollback_capture",
-                        side_effect=[_ledger.snapshot_paths, OSError("disk full")]):
+                        side_effect=_first_real_then_fail):
             r = self._call("probe", [
                 {"action": "patch", "old_string": "Step 1.", "new_string": "Step ONE."},
                 {"action": "write_file", "file_path": "bad/nope.md", "file_content": "x"},
             ])
+        self.assertEqual(len(calls), 2, "rollback must attempt pre and post captures")
         self.assertFalse(r["success"])
         self.assertIn("post-restore capture failed", r["error"])
         content = open(os.path.join(self.home, "skills", "probe", "SKILL.md")).read()
