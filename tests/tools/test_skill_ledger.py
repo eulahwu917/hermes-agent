@@ -152,12 +152,10 @@ def test_references_patch_receipt_names_the_patched_file_with_real_hashes(ledger
     assert (entry.get("evidence") or {}).get("file_path") == "references/api.md"
     bmap = {i["path"]: i["sha256"] for i in entry["before"]}
     amap = {i["path"]: i["sha256"] for i in entry["after"]}
-    target_paths = [p for p in amap if p.endswith("references/api.md")]
-    assert len(target_paths) == 1, "receipt must name the patched file"
-    target_path = target_paths[0]
-    assert bmap[target_path] == hashlib.sha256(pre_bytes).hexdigest()
-    assert amap[target_path] == hashlib.sha256(post_bytes).hexdigest()
-    assert bmap[target_path] != amap[target_path]
+    assert str(target) in amap, "receipt must name the patched file"
+    assert bmap[str(target)] == hashlib.sha256(pre_bytes).hexdigest()
+    assert amap[str(target)] == hashlib.sha256(post_bytes).hexdigest()
+    assert bmap[str(target)] != amap[str(target)]
 
 
 def test_skill_md_patch_behaviour_and_legacy_entry_readability(ledger_env):
@@ -180,9 +178,8 @@ def test_skill_md_patch_behaviour_and_legacy_entry_readability(ledger_env):
              if r["action"] == "patch"][0]
     bmap = {i["path"]: i["sha256"] for i in entry["before"]}
     amap = {i["path"]: i["sha256"] for i in entry["after"]}
-    md_paths = [p for p in amap if p.endswith("/SKILL.md")]
-    assert md_paths, "SKILL.md patch receipt names SKILL.md"
-    assert bmap[md_paths[0]] != amap[md_paths[0]]
+    assert str(skill_md) in amap, "SKILL.md patch receipt names SKILL.md"
+    assert bmap[str(skill_md)] != amap[str(skill_md)]
 
     # Legacy hollow-shape entry (SKILL.md only, identical before/after pair):
     # still readable and parseable.
