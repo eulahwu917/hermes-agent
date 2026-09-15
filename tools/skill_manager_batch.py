@@ -7,6 +7,7 @@ import logging
 import posixpath
 import shutil
 import tempfile
+from contextlib import suppress
 from pathlib import Path
 
 logger = logging.getLogger("tools.skill_manager_tool")
@@ -97,16 +98,34 @@ def _restore_snapshot(pre_dir, snap, post_dir) -> None:
     shutil.rmtree(aside, ignore_errors=True)
 
 
-def _rollback(snapshots, find_skill):
-    """Restore every snapshot. Returns (note, failed)."""
+def _rollback(snapshots, find_skill, *, evidence=None):
+    """Restore every snapshot and ledger each restore. Returns (note, failed).
+
+    Each restore is ledgered as a ``rollback`` entry whose ``before`` is the
+    partially-applied state captured from the live dir just before the restore and
+    whose ``after`` is the restored state captured just after. Emitting that entry
+    closes the chain: the next mutation's ``before`` equals this entry's ``after``
+    instead of the pre-batch bytes, so the scanner no longer sees an unattributed
+    ``next.before == prev.before`` break (Planner POV Q1 option c).
+    """
     notes = []
     for nm, (pre_dir, snap) in snapshots.items():
+        before = None
         try:
             post = find_skill(nm)
-            _restore_snapshot(pre_dir, snap, Path(post["path"]) if post else None)
+            post_dir = Path(post["path"]) if post else None
+            with suppress(Exception):
+                from tools import skill_ledger as _ledger
+                before = _ledger.snapshot_paths(post_dir)
+            _restore_snapshot(pre_dir, snap, post_dir)
         except Exception as exc:  # noqa: BLE001
             notes.append(f"ROLLBACK FAILED for '{nm}' ({exc})"
                          + (f"; snapshot preserved at '{snap}'" if snap is not None else ""))
+            continue
+        with suppress(Exception):
+            from tools import skill_ledger as _ledger
+            _ledger.append_entry("rollback", nm, before=before or [],
+                                 after=_ledger.snapshot_paths(pre_dir), evidence=evidence)
     return ("; ".join(notes) if notes else "all touched skills rolled back"), bool(notes)
 
 
@@ -162,7 +181,11 @@ def _skill_manage_batch(operations, default_name: str = None, task_id: str = Non
             except Exception:  # noqa: BLE001
                 parsed = {"success": False, "error": "unparseable op result"}
             if not parsed.get("success"):
-                note, rollback_failed = _rollback(snapshots, _smt._find_skill)
+                note, rollback_failed = _rollback(
+                    snapshots, _smt._find_skill,
+                    evidence={"batch_rollback": True, "failed_index": i,
+                              "failed_action": op.get("action"),
+                              "failed_skill": names[i]})
                 fail = {  # key order is wire-visible
                     "success": False,
                     "error": (f"operations[{i}] ({op['action']} on '{names[i]}') failed: "

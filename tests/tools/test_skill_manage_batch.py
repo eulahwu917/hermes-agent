@@ -176,6 +176,65 @@ class TestSkillManageBatch(unittest.TestCase):
         self.assertNotIn("Step A.", content)
         self.assertFalse(os.path.exists(os.path.join(self.home, "skills", "beta")))
 
+    def test_failed_batch_ledgers_the_rollback(self):
+        """A failed atomic batch emits a ``rollback`` ledger entry whose ``after`` is the
+        pre-batch state, so the next mutation's ``before`` equals it - the chain closes
+        instead of an unattributed ``next.before == prev.before`` break."""
+        from tools import skill_ledger as _ledger
+
+        self._call("probe", [{"action": "create", "content": SK.format(n="probe")}])
+        r = self._call("probe", [
+            {"action": "patch", "old_string": "Step 1.", "new_string": "Step ONE."},
+            {"action": "write_file", "file_path": "bad/nope.md", "file_content": "x"},
+        ])
+        self.assertFalse(r["success"])
+
+        rows = [row for row in _ledger.list_entries(skill="probe")
+                if row["action"] == "rollback"]
+        self.assertEqual(len(rows), 1, rows)
+        entry = rows[0]
+        skill_md = os.path.join(self.home, "skills", "probe", "SKILL.md")
+        bmap = {i["path"]: i["sha256"] for i in entry["before"]}
+        amap = {i["path"]: i["sha256"] for i in entry["after"]}
+        # after == the pre-batch (create) state; before != after (the patch was undone).
+        create = [row for row in _ledger.list_entries(skill="probe")
+                  if row["action"] == "create"][0]
+        cmap = {i["path"]: i["sha256"] for i in create["after"]}
+        self.assertEqual(amap[skill_md], cmap[skill_md])
+        self.assertNotEqual(bmap[skill_md], amap[skill_md])
+        # The next mutation's before equals the rollback entry's after (chain closed).
+        r2 = self._call("probe", [{"action": "patch", "old_string": "Step 1.",
+                                   "new_string": "Step 1 (again)."}])
+        self.assertTrue(r2["success"], r2)
+        follow = [row for row in _ledger.list_entries(skill="probe")
+                  if row["action"] == "patch"][0]
+        fmap = {i["path"]: i["sha256"] for i in follow["before"]}
+        self.assertEqual(fmap[skill_md], amap[skill_md])
+
+    def test_cross_skill_failed_batch_ledgers_each_rollback(self):
+        """A cross-skill failed batch emits one ``rollback`` entry per touched skill,
+        including a batch-created skill whose rollback removes it (after == [])."""
+        from tools import skill_ledger as _ledger
+
+        self._call("alpha", [{"action": "create", "content": SK.format(n="alpha")}])
+        r = json.loads(self.smt.skill_manage(action="", name="", operations=[
+            {"name": "alpha", "action": "patch",
+             "old_string": "Step 1.", "new_string": "Step A."},
+            {"name": "beta", "action": "create", "content": SK.format(n="beta")},
+            {"name": "beta", "action": "write_file",
+             "file_path": "bad/nope.md", "file_content": "x"},
+        ]))
+        self.assertFalse(r["success"])
+        for nm in ("alpha", "beta"):
+            rows = [row for row in _ledger.list_entries(skill=nm)
+                    if row["action"] == "rollback"]
+            self.assertEqual(len(rows), 1, (nm, rows))
+        # beta was batch-created, so its rollback removed it: after == [].
+        beta = [row for row in _ledger.list_entries(skill="beta")
+                if row["action"] == "rollback"][0]
+        self.assertEqual(beta["after"], [])
+        self.assertTrue(beta["before"])
+
     def test_failed_restore_never_destroys_the_skill(self):
         """Rollback used to rmtree the live skill directory BEFORE
         copytree restored the snapshot. When copytree failed (disk full,
