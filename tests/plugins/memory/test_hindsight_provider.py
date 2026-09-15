@@ -1540,13 +1540,31 @@ class TestClientAutoUpgradeRoutesThroughLazyDeps:
         return calls
 
     def test_upgrade_uses_install_specs_not_subprocess(self, tmp_path, monkeypatch):
-        from plugins.memory.hindsight import _MIN_CLIENT_VERSION
+        from plugins.memory.hindsight import _CLIENT_DEPENDENCY
         from tools.lazy_deps import InstallSpecsResult
 
         calls = self._init_with_outdated_client(
             tmp_path, monkeypatch, InstallSpecsResult(ok=True)
         )
-        assert calls == [(f"hindsight-client>={_MIN_CLIENT_VERSION}",)]
+        assert calls == [(_CLIENT_DEPENDENCY,)]
+
+    def test_compatible_client_does_not_trigger_upgrade(self, tmp_path, monkeypatch):
+        import importlib.metadata as md
+        import tools.lazy_deps as lazy_deps_mod
+
+        config_path = tmp_path / "hindsight" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps({"mode": "cloud"}))
+        monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: tmp_path)
+        monkeypatch.setattr(md, "version", lambda name: "0.9.2")
+        calls = []
+        monkeypatch.setattr(
+            lazy_deps_mod, "install_specs", lambda specs, **kw: calls.append(tuple(specs))
+        )
+
+        HindsightMemoryProvider().initialize(session_id="s", hermes_home=str(tmp_path), platform="cli")
+
+        assert calls == []
 
     def test_blocked_upgrade_is_nonfatal_and_surfaces_reason(
         self, tmp_path, monkeypatch, caplog

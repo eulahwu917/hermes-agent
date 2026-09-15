@@ -207,6 +207,34 @@ class TestIsSatisfiedVersionAware:
         self._fake_version(monkeypatch, {"slack-bolt": "1.27.0"})
         assert ld._is_satisfied("slack-bolt>=1.18.0,<2") is True
 
+    @pytest.mark.parametrize("installed,supported", [
+        ("0.8.5", True), ("0.9.2", True), ("0.6.1", False), ("0.10.0", False),
+    ])
+    def test_hindsight_install_paths_share_supported_range(self, monkeypatch, installed, supported):
+        """Compatible clients survive lazy loading and every installer agrees."""
+        from pathlib import Path
+        import tomllib
+        import yaml
+        from packaging.requirements import Requirement
+        from plugins.memory.hindsight import _CLIENT_DEPENDENCY
+
+        root = Path(ld.__file__).resolve().parent.parent
+        project = tomllib.loads((root / "pyproject.toml").read_text())
+        manifest = yaml.safe_load((root / "plugins/memory/hindsight/plugin.yaml").read_text())
+        lock = tomllib.loads((root / "uv.lock").read_text())
+        locked_project = next(p for p in lock["package"] if p["name"] == "hermes-agent")
+        locked_spec = next(r["specifier"] for r in locked_project["metadata"]["requires-dist"]
+                           if r["name"] == "hindsight-client")
+        spec = ld.feature_specs("memory.hindsight")[0]
+        expected = Requirement(spec).specifier
+        assert Requirement(_CLIENT_DEPENDENCY).specifier == expected
+        for declaration in project["project"]["optional-dependencies"]["hindsight"] + manifest["pip_dependencies"]:
+            assert Requirement(declaration).specifier == expected
+        assert Requirement(f"hindsight-client{locked_spec}").specifier == expected
+
+        self._fake_version(monkeypatch, {"hindsight-client": installed})
+        assert ld._is_satisfied(spec) is supported
+
 
     def test_bare_package_name_presence_is_enough(self, monkeypatch):
         # No version constraint — presence alone counts as satisfied.

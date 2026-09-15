@@ -191,7 +191,10 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
 
     # ─── Memory providers ──────────────────────────────────────────────────
     "memory.honcho": ("honcho-ai==2.2.0",),
-    "memory.hindsight": ("hindsight-client==0.8.5",),
+    # The plugin requires client 0.8.5 for recall parameters, but must not
+    # replace a compatible newer client at session start.  Keep this range in
+    # sync with the hindsight extra and plugin manifest.
+    "memory.hindsight": ("hindsight-client>=0.8.5,<0.10",),
     # supermemory + mem0 are opt-in cloud memory providers with their own
     # SDKs. On the published Docker image the agent venv is sealed
     # (HERMES_DISABLE_LAZY_INSTALLS=1) and lazy installs are redirected to the
