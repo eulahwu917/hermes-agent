@@ -1373,8 +1373,16 @@ DEFAULT_CONFIG = {
         # Audit ledger: every skill mutation appends to ~/.hermes/skills/.curator_ledger.jsonl with
         # before/after hashes (blobs under ~/.hermes/.curator_backups/blobs/); powers `hermes
         # curator ledger` / `rollback <entry-id>`. Never a gate — failures can't block.
+        # Entries also carry the additive `chain_break` annotation (false/true/"unverified") that
+        # says whether the entry continued this writer's last-known manifest on a fresh ledger
+        # tail, so a break is self-documenting at the point it happens.
         # See #79686.
         "ledger": True,
+        # WARNING only (never a refusal) when the generic `patch`/`write_file` tools write a file
+        # under HERMES_HOME/skills/. Generic writes bypass the ledger's capture→append path and
+        # show up later as an unexplained chain break; prefer skill_manage for skill edits.
+        # Off by default: a script writing from inside Python is invisible to this guard.
+        "write_guard": False,
     },
 
     # Curator — background maintenance of AGENT-CREATED skills (never hub-installed): marks

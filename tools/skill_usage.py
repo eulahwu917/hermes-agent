@@ -559,9 +559,10 @@ def _relocate(src: Path, dest: Path, skill_name: str, action: str, **capture_kwa
     suppression + state side effects; rename falls back to shutil.move across devices."""
     try:
         from tools import skill_ledger as _ledger
-        _ledger_before = _ledger.capture_before(src, **capture_kwargs)
+        _ledger_before, _ledger_basis = _ledger.capture_before_with_basis(
+            src, skill=skill_name, **{k: v for k, v in capture_kwargs.items() if k != "skill"})
     except Exception:
-        _ledger = _ledger_before = None  # type: ignore[assignment]
+        _ledger = _ledger_before = _ledger_basis = None  # type: ignore[assignment]
     try:
         src.rename(dest)
     except OSError:
@@ -576,7 +577,8 @@ def _relocate(src: Path, dest: Path, skill_name: str, action: str, **capture_kwa
     set_state(skill_name, STATE_ARCHIVED if archiving else STATE_ACTIVE)
     with suppress(Exception):
         if _ledger is not None:
-            _ledger.record_mutation(action, skill_name, before=_ledger_before or [], after_root=dest)
+            _ledger.record_mutation(action, skill_name, before=_ledger_before or [],
+                                    after_root=dest, chain_basis=_ledger_basis)
     return True, f"{action}d to {dest}"
 
 
