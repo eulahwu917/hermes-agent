@@ -10,6 +10,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
@@ -234,6 +235,116 @@ class TestSkillManageBatch(unittest.TestCase):
                 if row["action"] == "rollback"][0]
         self.assertEqual(beta["after"], [])
         self.assertTrue(beta["before"])
+
+    def test_failed_batch_disabled_ledger_still_restores_without_blobs(self):
+        """R1: skills.ledger=false still restores the filesystem, but the rollback
+        must not persist blob content or entry lines (the opt-out contract, which
+        single operations already honour)."""
+        from tools import skill_ledger as _ledger
+
+        with mock.patch("hermes_cli.config.load_config",
+                        lambda *a, **k: {"skills": {"ledger": False}}):
+            self._call("probe", [{"action": "create", "content": SK.format(n="probe")}])
+            r = self._call("probe", [
+                {"action": "patch", "old_string": "Step 1.", "new_string": "Step ONE."},
+                {"action": "write_file", "file_path": "bad/nope.md", "file_content": "x"},
+            ])
+        self.assertFalse(r["success"])
+        content = open(os.path.join(self.home, "skills", "probe", "SKILL.md")).read()
+        self.assertIn("Step 1.", content)       # filesystem restore is unconditional
+        self.assertNotIn("Step ONE.", content)
+        self.assertFalse(_ledger.ledger_path().exists())
+        self.assertFalse(_ledger.blobs_dir().exists())
+
+    def test_rollback_pre_capture_failure_skips_entry_and_notes_it(self):
+        """R2: a failed pre-restore capture must NOT be fabricated into an empty
+        before manifest; the rollback entry is skipped, the restore still happens,
+        and the loss is observable in the batch error."""
+        from tools import skill_ledger as _ledger
+
+        self._call("probe", [{"action": "create", "content": SK.format(n="probe")}])
+        with mock.patch("tools.skill_manager_batch._rollback_capture",
+                        side_effect=OSError("disk full")):
+            r = self._call("probe", [
+                {"action": "patch", "old_string": "Step 1.", "new_string": "Step ONE."},
+                {"action": "write_file", "file_path": "bad/nope.md", "file_content": "x"},
+            ])
+        self.assertFalse(r["success"])
+        self.assertIn("telemetry loss for 'probe'", r["error"])
+        self.assertIn("pre-restore capture failed", r["error"])
+        content = open(os.path.join(self.home, "skills", "probe", "SKILL.md")).read()
+        self.assertIn("Step 1.", content)       # restore happened despite telemetry loss
+        self.assertNotIn("Step ONE.", content)
+        rows = [row for row in _ledger.list_entries(skill="probe")
+                if row["action"] == "rollback"]
+        self.assertEqual(rows, [])
+
+    def test_rollback_post_capture_failure_skips_entry_and_notes_it(self):
+        """R2: a failed post-restore capture is not silently dropped; the entry is
+        skipped, the restore still happens, and the error names the loss."""
+        from tools import skill_ledger as _ledger
+
+        self._call("probe", [{"action": "create", "content": SK.format(n="probe")}])
+        with mock.patch("tools.skill_manager_batch._rollback_capture",
+                        side_effect=[_ledger.snapshot_paths, OSError("disk full")]):
+            r = self._call("probe", [
+                {"action": "patch", "old_string": "Step 1.", "new_string": "Step ONE."},
+                {"action": "write_file", "file_path": "bad/nope.md", "file_content": "x"},
+            ])
+        self.assertFalse(r["success"])
+        self.assertIn("post-restore capture failed", r["error"])
+        content = open(os.path.join(self.home, "skills", "probe", "SKILL.md")).read()
+        self.assertIn("Step 1.", content)
+        self.assertNotIn("Step ONE.", content)
+        rows = [row for row in _ledger.list_entries(skill="probe")
+                if row["action"] == "rollback"]
+        self.assertEqual(rows, [])
+
+    def test_rollback_append_failure_skips_entry_and_notes_it(self):
+        """R2: when the rollback append itself fails (returns None), no entry lands;
+        the restore stands and the loss is observable."""
+        from tools import skill_ledger as _ledger
+
+        self._call("probe", [{"action": "create", "content": SK.format(n="probe")}])
+        real = _ledger.append_entry
+
+        def _failing_rollback_append(action, skill, **kwargs):
+            if (kwargs.get("evidence") or {}).get("batch_rollback"):
+                return None
+            return real(action, skill, **kwargs)
+
+        with mock.patch.object(_ledger, "append_entry", _failing_rollback_append):
+            r = self._call("probe", [
+                {"action": "patch", "old_string": "Step 1.", "new_string": "Step ONE."},
+                {"action": "write_file", "file_path": "bad/nope.md", "file_content": "x"},
+            ])
+        self.assertFalse(r["success"])
+        self.assertIn("telemetry loss for 'probe'", r["error"])
+        content = open(os.path.join(self.home, "skills", "probe", "SKILL.md")).read()
+        self.assertIn("Step 1.", content)
+        self.assertNotIn("Step ONE.", content)
+        rows = [row for row in _ledger.list_entries(skill="probe")
+                if row["action"] == "rollback"]
+        self.assertEqual(rows, [])
+
+    def test_failed_restore_emits_no_rollback_entry(self):
+        """R2: a FAILED filesystem restore emits no successful rollback entry -
+        there is nothing truthful to record, and a fabricated restore entry must
+        never appear in the ledger."""
+        from tools import skill_ledger as _ledger
+
+        self._call("probe", [{"action": "create", "content": SK.format(n="probe")}])
+        with mock.patch("tools.skill_manager_batch._restore_snapshot",
+                        side_effect=OSError("copytree failed")):
+            r = self._call("probe", [
+                {"action": "patch", "old_string": "Step 1.", "new_string": "Step ONE."},
+                {"action": "write_file", "file_path": "bad/nope.md", "file_content": "x"},
+            ])
+        self.assertFalse(r["success"])
+        self.assertIn("ROLLBACK FAILED", r["error"])
+        rows = [row for row in _ledger.list_entries(skill="probe")
+                if row["action"] == "rollback"]
+        self.assertEqual(rows, [])
 
     def test_failed_restore_never_destroys_the_skill(self):
         """Rollback used to rmtree the live skill directory BEFORE

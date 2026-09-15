@@ -7,7 +7,6 @@ import logging
 import posixpath
 import shutil
 import tempfile
-from contextlib import suppress
 from pathlib import Path
 
 logger = logging.getLogger("tools.skill_manager_tool")
@@ -98,6 +97,15 @@ def _restore_snapshot(pre_dir, snap, post_dir) -> None:
     shutil.rmtree(aside, ignore_errors=True)
 
 
+def _rollback_capture(root):
+    """Rollback-path snapshot seam: capture *root* ({path, sha256} list, [] when absent).
+
+    Raises on I/O failure — the caller owns the telemetry decision, so a failed
+    capture is recorded as a loss, never fabricated into an empty manifest."""
+    from tools import skill_ledger as _ledger
+    return _ledger.snapshot_paths(root)
+
+
 def _rollback(snapshots, find_skill, *, evidence=None):
     """Restore every snapshot and ledger each restore. Returns (note, failed).
 
@@ -107,26 +115,69 @@ def _rollback(snapshots, find_skill, *, evidence=None):
     closes the chain: the next mutation's ``before`` equals this entry's ``after``
     instead of the pre-batch bytes, so the scanner no longer sees an unattributed
     ``next.before == prev.before`` break (Planner POV Q1 option c).
+
+    Telemetry discipline (the filesystem restore is unconditional throughout):
+
+    * ``skills.ledger=false`` is checked BEFORE any capture, so an opt-out cannot
+      persist blob content or entry lines from a batch rollback.
+    * A failed capture never becomes an empty manifest: the rollback entry is
+      SKIPPED and the loss is reported in the note (with the restore itself
+      recorded as successful), so rollback_entry can never misread a fabricated
+      empty ``before`` as "the mutation created every file".
+    * A failed filesystem restore emits NO rollback entry (nothing truthful to
+      record), and ``failed`` flags only restore failures - the caller keeps the
+      snapshots for manual recovery - not telemetry losses.
     """
-    notes = []
+    failures, losses = [], []
     for nm, (pre_dir, snap) in snapshots.items():
-        before = None
+        from tools import skill_ledger as _ledger
+        ledgered = _ledger.ledger_enabled()
+        before = before_err = None
         try:
             post = find_skill(nm)
             post_dir = Path(post["path"]) if post else None
-            with suppress(Exception):
-                from tools import skill_ledger as _ledger
-                before = _ledger.snapshot_paths(post_dir)
+            if ledgered:
+                try:
+                    before = _rollback_capture(post_dir)
+                except Exception as exc:  # noqa: BLE001
+                    before_err = f"pre-restore capture failed ({exc})"
             _restore_snapshot(pre_dir, snap, post_dir)
         except Exception as exc:  # noqa: BLE001
-            notes.append(f"ROLLBACK FAILED for '{nm}' ({exc})"
-                         + (f"; snapshot preserved at '{snap}'" if snap is not None else ""))
+            failures.append(f"ROLLBACK FAILED for '{nm}' ({exc})"
+                            + (f"; snapshot preserved at '{snap}'" if snap is not None else ""))
             continue
-        with suppress(Exception):
-            from tools import skill_ledger as _ledger
-            _ledger.append_entry("rollback", nm, before=before or [],
-                                 after=_ledger.snapshot_paths(pre_dir), evidence=evidence)
-    return ("; ".join(notes) if notes else "all touched skills rolled back"), bool(notes)
+        if not ledgered:
+            continue  # restore done; the opt-out forbids blobs and entry lines
+        if before_err is not None:
+            msg = (f"telemetry loss for '{nm}': rollback entry NOT emitted - {before_err}; "
+                   f"the restore itself succeeded")
+            losses.append(msg)
+            logger.warning("skill_manage batch: %s", msg)
+            continue
+        try:
+            after = _rollback_capture(pre_dir)
+        except Exception as exc:  # noqa: BLE001
+            msg = (f"telemetry loss for '{nm}': rollback entry NOT emitted - "
+                   f"post-restore capture failed ({exc}); the restore itself succeeded")
+            losses.append(msg)
+            logger.warning("skill_manage batch: %s", msg)
+            continue
+        try:
+            entry_id = _ledger.append_entry("rollback", nm, before=before,
+                                            after=after, evidence=evidence)
+        except Exception as exc:  # noqa: BLE001 - append_entry never raises; belt and braces
+            entry_id = None
+            logger.warning("skill_manage batch: rollback append raised for '%s' (%s)", nm, exc)
+        if entry_id is None:
+            msg = (f"telemetry loss for '{nm}': rollback entry NOT emitted - append failed "
+                   f"or the ledger was disabled mid-rollback; the restore itself succeeded")
+            losses.append(msg)
+            logger.warning("skill_manage batch: %s", msg)
+    if failures or losses:
+        note = "; ".join(failures + losses)
+    else:
+        note = "all touched skills rolled back"
+    return note, bool(failures)
 
 
 def _skill_manage_batch(operations, default_name: str = None, task_id: str = None,
