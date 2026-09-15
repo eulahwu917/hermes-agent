@@ -8,6 +8,7 @@ The first four tests are adapted from PR #50261 by @yu-xin-c (autonomous
 skill history), reshaped for the all-actor JSONL ledger design.
 """
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -119,6 +120,80 @@ def test_foreground_patch_is_ledgered_as_agent(ledger_env):
     rows = [r for r in skill_ledger.list_entries(skill="my-skill") if r["action"] == "patch"]
     assert len(rows) == 1
     assert rows[0]["actor"] == "agent"
+
+
+
+def test_references_patch_receipt_names_the_patched_file_with_real_hashes(ledger_env):
+    """A patch whose target is a references/... file must produce a ledger receipt that
+    names THAT file with its real pre/post sha256 (staging-migration applied-state
+    receipts, card t_cf6138a6). The manifest also carries the skill's unchanged
+    SKILL.md row, so checks must diff manifests or read evidence.file_path - never
+    assume the first manifest row names the mutation."""
+    from tools import skill_ledger
+    from tools.skill_manager_tool import skill_manage
+
+    assert _create()["success"] is True
+    target = ledger_env["skills"] / "my-skill" / "references" / "api.md"
+    wrote = json.loads(skill_manage(
+        action="write_file", name="my-skill", file_path="references/api.md",
+        file_content="line A\nline B\n"))
+    assert wrote["success"] is True
+    pre_bytes = target.read_bytes()
+
+    patched = json.loads(skill_manage(
+        action="patch", name="my-skill", file_path="references/api.md",
+        old_string="line B\n", new_string="line B patched\n"))
+    assert patched["success"] is True
+    post_bytes = target.read_bytes()
+    assert pre_bytes != post_bytes
+
+    entry = [r for r in skill_ledger.list_entries(skill="my-skill")
+             if r["action"] == "patch"][0]
+    assert (entry.get("evidence") or {}).get("file_path") == "references/api.md"
+    bmap = {i["path"]: i["sha256"] for i in entry["before"]}
+    amap = {i["path"]: i["sha256"] for i in entry["after"]}
+    target_paths = [p for p in amap if p.endswith("references/api.md")]
+    assert len(target_paths) == 1, "receipt must name the patched file"
+    target_path = target_paths[0]
+    assert bmap[target_path] == hashlib.sha256(pre_bytes).hexdigest()
+    assert amap[target_path] == hashlib.sha256(post_bytes).hexdigest()
+    assert bmap[target_path] != amap[target_path]
+
+
+def test_skill_md_patch_behaviour_and_legacy_entry_readability(ledger_env):
+    """SKILL.md-targeted patches keep their current receipt shape, and legacy
+    SKILL.md-only entries (the shape a hollow readback mistakes for a receipt)
+    remain readable - the record shape has not changed (criterion 2 + 3)."""
+    from tools import skill_ledger
+    from tools.skill_manager_tool import skill_manage
+
+    assert _create()["success"] is True
+    skill_md = ledger_env["skills"] / "my-skill" / "SKILL.md"
+    pre = skill_md.read_bytes()
+    patched = json.loads(skill_manage(
+        action="patch", name="my-skill",
+        old_string="Original body.", new_string="Updated body."))
+    assert patched["success"] is True
+    assert skill_md.read_bytes() != pre
+
+    entry = [r for r in skill_ledger.list_entries(skill="my-skill")
+             if r["action"] == "patch"][0]
+    bmap = {i["path"]: i["sha256"] for i in entry["before"]}
+    amap = {i["path"]: i["sha256"] for i in entry["after"]}
+    md_paths = [p for p in amap if p.endswith("/SKILL.md")]
+    assert md_paths, "SKILL.md patch receipt names SKILL.md"
+    assert bmap[md_paths[0]] != amap[md_paths[0]]
+
+    # Legacy hollow-shape entry (SKILL.md only, identical before/after pair):
+    # still readable and parseable.
+    legacy_id = skill_ledger.append_entry(
+        "patch", "my-skill",
+        before=[{"path": str(skill_md), "sha256": "a" * 64}],
+        after=[{"path": str(skill_md), "sha256": "a" * 64}])
+    assert legacy_id is not None
+    reread = skill_ledger.get_entry(legacy_id)
+    assert reread["before"][0]["path"] == str(skill_md)
+    assert reread["after"][0]["sha256"] == "a" * 64
 
 
 def test_rollback_refuses_paths_outside_hermes_home(ledger_env):
