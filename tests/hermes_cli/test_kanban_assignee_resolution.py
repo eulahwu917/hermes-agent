@@ -196,3 +196,101 @@ def test_dispatch_silent_for_valid_assignees(kanban_home, only_alice_on_disk, ca
     with kbc.connect() as conn:
         assert _events_of_kind(conn, alice, "assignee_unresolved") == []
     assert not any("does not resolve" in r.message for r in caplog.records)
+
+
+# ---------------------------------------------------------------------------
+# 5. CLI dispatch --json surfacing (F3, review round 1)
+# ---------------------------------------------------------------------------
+
+def test_dispatch_json_includes_unresolved_assignees(
+        kanban_home, only_alice_on_disk, monkeypatch, capsys):
+    """``hermes kanban dispatch --json`` must expose the unresolved card ids
+    + assignee names, and keep exposing them on a SECOND pass once the
+    event/log dedupe has activated. Valid-profile control: alice spawns via
+    the fake and never appears in assignee_unresolved."""
+    import argparse
+    import json
+
+    from hermes_cli import kanban_db_dispatch as kbd
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"kanban": {}})
+    spawns: list = []
+    monkeypatch.setattr(kbd, "_default_spawn", _fake_spawn_factory(spawns))
+
+    with kbc.connect() as conn:
+        ghost = kb.create_task(conn, title="ghost card", assignee="ghost")
+        alice = kb.create_task(conn, title="ok card", assignee="alice")
+
+    args = argparse.Namespace(dry_run=False, max=None, failure_limit=2, json=True)
+
+    rc = kc._cmd_dispatch(args)
+    d = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert d["assignee_unresolved"] == [
+        {"task_id": ghost, "assignee": "ghost"},
+    ], d
+    assert ghost in d["skipped_nonspawnable"]  # existing bucket semantics kept
+    assert alice not in {e["task_id"] for e in d["assignee_unresolved"]}
+    assert alice in [s["task_id"] for s in d["spawned"]]  # valid control spawns
+    assert alice in spawns
+
+    # Second pass: the event + log warning are now deduped, but the JSON
+    # diagnostic must still carry the unresolved pair.
+    with kbc.connect() as conn:
+        n_events = len(_events_of_kind(conn, ghost, "assignee_unresolved"))
+    rc2 = kc._cmd_dispatch(args)
+    d2 = json.loads(capsys.readouterr().out)
+    assert rc2 == 0
+    assert d2["assignee_unresolved"] == [
+        {"task_id": ghost, "assignee": "ghost"},
+    ], d2
+    with kbc.connect() as conn:
+        # created + dispatch = 2; the second pass must not have appended more.
+        assert len(_events_of_kind(conn, ghost, "assignee_unresolved")) == n_events == 2
+
+
+def test_dispatch_json_empty_for_valid_assignees(
+        kanban_home, only_alice_on_disk, monkeypatch, capsys):
+    """Valid-only board: assignee_unresolved is present and empty, and the
+    alice card spawns normally."""
+    import argparse
+    import json
+
+    from hermes_cli import kanban_db_dispatch as kbd
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"kanban": {}})
+    spawns: list = []
+    monkeypatch.setattr(kbd, "_default_spawn", _fake_spawn_factory(spawns))
+
+    with kbc.connect() as conn:
+        alice = kb.create_task(conn, title="ok card", assignee="alice")
+
+    args = argparse.Namespace(dry_run=False, max=None, failure_limit=2, json=True)
+    rc = kc._cmd_dispatch(args)
+    d = json.loads(capsys.readouterr().out)
+    assert rc == 0
+    assert d["assignee_unresolved"] == []
+    assert alice in [s["task_id"] for s in d["spawned"]]
+
+
+def test_dispatch_text_line_excludes_unresolved_from_lane_ok_label(
+        kanban_home, only_alice_on_disk, monkeypatch, capsys):
+    """Text output must not label an unresolved-assignee id as a
+    'terminal lane, OK' skip: those ids get the !! line instead (N1)."""
+    import argparse
+
+    from hermes_cli import kanban_db_dispatch as kbd
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {"kanban": {}})
+    spawns: list = []
+    monkeypatch.setattr(kbd, "_default_spawn", _fake_spawn_factory(spawns))
+
+    with kbc.connect() as conn:
+        ghost = kb.create_task(conn, title="ghost card", assignee="ghost")
+
+    args = argparse.Namespace(dry_run=False, max=None, failure_limit=2, json=False)
+    rc = kc._cmd_dispatch(args)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert f"!! Skipped (assignee 'ghost' has NO profile on disk" in out
+    # The 'terminal lane, OK' line must not contain the ghost id.
+    for line in out.splitlines():
+        if "terminal lane, OK" in line:
+            assert ghost not in line, out

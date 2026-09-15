@@ -51,8 +51,8 @@ def _warn_unresolved_assignee(assignee: str, verb: str) -> None:
         f"⚠ kanban {verb}: assignee {assignee!r} does not resolve to a profile "
         f"on disk — this card will NEVER be dispatched.\n"
         f"   If {assignee!r} is a typo, fix it now: `hermes kanban assignees` "
-        f"lists the on-disk profiles and `hermes -p <name> setup` creates a "
-        f"missing one.\n"
+        f"lists the on-disk profiles and `hermes profile create <name>` "
+        f"creates a missing one.\n"
         f"   If it is a deliberate external lane (a terminal claims it via "
         f"`hermes kanban claim`), you can ignore this.",
         file=sys.stderr,

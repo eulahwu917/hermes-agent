@@ -100,6 +100,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             ],
             "skipped_unassigned": res.skipped_unassigned,
             "skipped_nonspawnable": res.skipped_nonspawnable,
+            "assignee_unresolved": [
+                {"task_id": tid, "assignee": who} for (tid, who) in res.assignee_unresolved
+            ],
             "skipped_per_profile_capped": [
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
@@ -131,10 +134,14 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print(f"Skipped (unassigned): {', '.join(res.skipped_unassigned)}")
     for tid, who, current in res.skipped_per_profile_capped:
         print(f"Deferred ({who} at per-profile cap, {current} running): {tid}")
-    if res.skipped_nonspawnable:
+    # Unresolved-assignee ids also land in skipped_nonspawnable, but they get
+    # the !! warning below — don't also label them "terminal lane, OK".
+    _unresolved_ids = {tid for tid, _who in res.assignee_unresolved}
+    _nonspawnable_ok = [tid for tid in res.skipped_nonspawnable if tid not in _unresolved_ids]
+    if _nonspawnable_ok:
         print(
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
-            f"{', '.join(res.skipped_nonspawnable)}"
+            f"{', '.join(_nonspawnable_ok)}"
         )
     if res.assignee_unresolved:
         for tid, who in res.assignee_unresolved:

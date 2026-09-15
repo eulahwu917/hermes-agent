@@ -894,22 +894,32 @@ def _handle_create(args: dict, **kw) -> str:
             completion_contract=args.get("completion_contract"),
             initial_status=str(args.get("initial_status") or "running"),
             created_by=os.environ.get("HERMES_PROFILE") or "worker", session_id=session_id)
-        landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
+        landed_task = kb.get_task(conn, new_tid)
+        landed = _fields(landed_task, _CREATED_FIELDS)
         # Fail-fast visibility for the orchestrator: a typo'd/invented
         # assignee would otherwise produce a card that sits in ready forever
         # with no diagnostic anywhere. The warning rides on the tool result so
         # the calling agent sees it in-session, exactly when the typo happens.
+        # The verdict is derived from the RETURNED card's assignee, never the
+        # requested args: an idempotent retry returns the pre-existing card
+        # unchanged, so the warning must describe the card that actually
+        # landed (retry with a valid name must not warn for a ghost card it
+        # returned, and vice versa).
+        _landed_assignee = (getattr(landed_task, "assignee", None) or "").strip()
         try:
-            _unresolved = kb.assignee_resolves_to_profile(str(assignee))
+            _unresolved = (
+                kb.assignee_resolves_to_profile(_landed_assignee)
+                if _landed_assignee else None
+            )
         except Exception:
             _unresolved = None
         _warnings = None
         if _unresolved is False:
             _warnings = [(
-                f"assignee {assignee!r} does not resolve to a profile on disk — "
+                f"assignee {_landed_assignee!r} does not resolve to a profile on disk — "
                 f"the dispatcher will NEVER spawn this card. Fix the name "
                 f"(typo? `hermes kanban assignees` lists on-disk profiles; "
-                f"`hermes -p <name> setup` creates one) or confirm it is a "
+                f"`hermes profile create <name>` creates one) or confirm it is a "
                 f"deliberate external lane pulled via `hermes kanban claim`."
             )]
         return _ok(task_id=new_tid, **landed, warnings=_warnings,

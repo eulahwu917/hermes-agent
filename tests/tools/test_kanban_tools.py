@@ -1230,3 +1230,69 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         assert Path(atts[0].stored_path).read_bytes() == payload
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# kanban_create assignee-resolution warnings (t_35758409 F2, review round 1)
+#
+# The warning must describe the card the call actually RETURNED, not the
+# requested args: create_task is idempotent per idempotency_key and returns
+# the pre-existing card unchanged, so a retry with a different assignee
+# lands the OLD card. A retry with a valid name that returns a ghost card
+# must still warn; a retry with a ghost name that returns a valid card must
+# stay silent.
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def only_alice_resolves(monkeypatch):
+    from hermes_cli import profiles
+    monkeypatch.setattr(profiles, "profile_exists", lambda name: name == "alice")
+
+
+def test_create_warns_for_unresolved_assignee(worker_env, only_alice_resolves):
+    from tools import kanban_tools as kt
+
+    out = kt._handle_create({"title": "ghost card", "assignee": "ghost"})
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["warnings"] and "ghost" in d["warnings"][0], d
+
+
+def test_create_silent_for_valid_assignee(worker_env, only_alice_resolves):
+    from tools import kanban_tools as kt
+
+    out = kt._handle_create({"title": "ok card", "assignee": "alice"})
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["warnings"] is None, d
+
+
+def test_idempotent_retry_warns_for_returned_ghost_card(worker_env, only_alice_resolves):
+    """ghost create, then a retry with a VALID name + same key returns the
+    ghost card — the warning must name the returned card's assignee (ghost),
+    not the requested one (alice)."""
+    from tools import kanban_tools as kt
+
+    first = json.loads(kt._handle_create(
+        {"title": "card", "assignee": "ghost", "idempotency_key": "same-key"}))
+    retry = json.loads(kt._handle_create(
+        {"title": "card", "assignee": "alice", "idempotency_key": "same-key"}))
+
+    assert retry["task_id"] == first["task_id"]  # idempotency preserved
+    assert retry["warnings"], retry
+    assert "ghost" in retry["warnings"][0]
+    assert "alice" not in retry["warnings"][0]
+
+
+def test_idempotent_retry_stays_silent_for_returned_valid_card(worker_env, only_alice_resolves):
+    """valid create, then a retry with a GHOST name + same key returns the
+    valid card — no spurious ghost warning."""
+    from tools import kanban_tools as kt
+
+    first = json.loads(kt._handle_create(
+        {"title": "card", "assignee": "alice", "idempotency_key": "same-key-2"}))
+    retry = json.loads(kt._handle_create(
+        {"title": "card", "assignee": "ghost", "idempotency_key": "same-key-2"}))
+
+    assert retry["task_id"] == first["task_id"]  # idempotency preserved
+    assert retry["warnings"] is None, retry
