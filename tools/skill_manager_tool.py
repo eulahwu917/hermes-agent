@@ -710,7 +710,7 @@ _ACTION_HANDLERS = {
 
 
 def _record_success(action, name, result, *, file_path, absorbed_into, task_id,
-                    session_id, ledger_before) -> None:
+                    session_id, ledger_before, ledger_basis=None) -> None:
     """Best-effort post-mutation side effects (never break the tool): ledger, prompt-cache
     clear, curator telemetry, debounced sync push."""
     with suppress(Exception):
@@ -722,7 +722,8 @@ def _record_success(action, name, result, *, file_path, absorbed_into, task_id,
         _evidence.update({k: v for k, v in (("session_id", session_id), ("file_path", file_path)) if v})
         _ledger.record_mutation(
             action, name, before=ledger_before if ledger_before is not None else [],
-            after_root=_post["path"] if _post else None, evidence=_evidence)
+            after_root=_post["path"] if _post else None, evidence=_evidence,
+            chain_basis=ledger_basis)
     with suppress(Exception):
         from agent.prompt_builder import clear_skills_system_prompt_cache
         clear_skills_system_prompt_cache(clear_snapshot=True)
@@ -784,10 +785,11 @@ def skill_manage(
         # Audit ledger (tracker #79686 P3): capture the pre-mutation state of the skill directory so every
         # mutation — any actor — lands in the append-only JSONL ledger with before/after blobs.
         _ledger_before = None
+        _ledger_basis = None
         with suppress(Exception):
             from tools import skill_ledger as _ledger
             _pre = _find_skill(name)
-            _ledger_before = _ledger.capture_before(
+            _ledger_before, _ledger_basis = _ledger.capture_before_with_basis(
                 _pre["path"] if _pre else None, complete_package=(action == "delete"), skill=name)
         handler = _ACTION_HANDLERS.get(action, lambda a: _err(
             f"Unknown action '{action}'. Use: create, edit, patch, delete, write_file, remove_file"))
@@ -797,7 +799,9 @@ def skill_manage(
         if result.get("success"):
             _record_success(
                 action, name, result, file_path=file_path, absorbed_into=absorbed_into,
-                task_id=task_id, session_id=session_id, ledger_before=_ledger_before)
+                task_id=task_id, session_id=session_id, ledger_before=_ledger_before,
+                ledger_basis=_ledger_basis)
+
     return json.dumps(result, ensure_ascii=False)
 
 
