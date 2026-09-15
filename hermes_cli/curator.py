@@ -448,7 +448,8 @@ def _cmd_purge(args) -> int:
         return 1
     purged = 0
     for p in candidates:
-        before = skill_ledger.capture_before(p, complete_package=True, skill=p.name)
+        before, basis = skill_ledger.capture_before_with_basis(
+            p, complete_package=True, skill=p.name)
         try:
             shutil.rmtree(p)
         except OSError as e:
@@ -456,7 +457,7 @@ def _cmd_purge(args) -> int:
             continue
         skill_ledger.append_entry(
             "purge", p.name, before=before or [], after=[], actor="user",
-            evidence={"ttl_days": ttl_days})
+            evidence={"ttl_days": ttl_days}, chain_basis=basis)
         purged += 1
     print(f"curator: purged {purged} archived skill(s). Ledger entries recorded.")
     return 0

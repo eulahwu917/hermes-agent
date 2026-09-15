@@ -436,18 +436,120 @@ def test_delete_after_rehome_ledgers_full_package_from_backup(ledger_env):
         r for r in skill_ledger.list_entries(skill="my-skill")
         if r["action"] == "delete"
     ][0]
-    before_names = {Path(i["path"]).name for i in delete_entry["before"]}
-    assert "SKILL.md" in before_names
-    assert "extra.md" in before_names, (
-        "delete ledger captured only SKILL.md after the support files were "
-        "re-homed — rollback would restore a hollow skill (#96962)"
-    )
+    # EXACT path set (R1): every before path is inside the package. The round-1 shape
+    # stripped the package segment when the destination was the skills root and added
+    # <skills>/SKILL.md + <skills>/references/extra.md targets here — rollback restored 4
+    # paths where the pre-change code restored these 2.
+    before_paths = {Path(i["path"]) for i in delete_entry["before"]}
+    assert before_paths == {skill_md, extra}, before_paths
 
     ok, msg = skill_ledger.rollback_entry(delete_entry["id"])
     assert ok is True, msg
     assert skill_md.is_file()
     assert extra.is_file()
     assert extra.read_text(encoding="utf-8") == "roadmap body"
+    # Nothing was created OUTSIDE the package during rollback.
+    assert not (ledger_env["skills"] / "SKILL.md").exists()
+    assert not (ledger_env["skills"] / "references").exists()
+
+
+def test_sole_delete_batch_ledgers_exact_package_set(ledger_env):
+    """R1 sole-delete batch: the batch API routes a sole delete to the single-op handler, so
+    the delete entry's before set must be exactly the live package — no out-of-package
+    targets — even when the newest backup is the only source of a re-homed support file."""
+    from tools import skill_ledger
+    from tools.skill_manager_tool import skill_manage
+
+    assert _create()["success"] is True
+    skill_md = ledger_env["skills"] / "my-skill" / "SKILL.md"
+    extra = ledger_env["skills"] / "my-skill" / "references" / "extra.md"
+    wrote = json.loads(skill_manage(action="write_file", name="my-skill",
+                                    file_path="references/extra.md",
+                                    file_content="support file\n"))
+    assert wrote["success"] is True
+    _write_skills_tarball(
+        ledger_env["home"],
+        {"my-skill/SKILL.md": skill_md.read_text(encoding="utf-8"),
+         "my-skill/references/extra.md": "support file"},
+    )
+
+    deld = json.loads(skill_manage(
+        action="batch", name="my-skill",
+        operations=[{"action": "delete", "name": "my-skill"}]))
+    assert deld["success"] is True, deld
+
+    delete_entry = [r for r in skill_ledger.list_entries(skill="my-skill")
+                    if r["action"] == "delete"][0]
+    before_paths = {Path(i["path"]) for i in delete_entry["before"]}
+    assert before_paths == {skill_md, extra}, before_paths
+
+    ok, msg = skill_ledger.rollback_entry(delete_entry["id"])
+    assert ok is True, msg
+    assert skill_md.is_file() and extra.is_file()
+    assert not (ledger_env["skills"] / "SKILL.md").exists()
+
+
+def test_archive_ledgers_no_out_of_package_targets(ledger_env):
+    """R1 archive caller: archive captures the COMPLETE package (backup fill) with a missing
+    root — the archive entry's before set must stay exactly the live package, and rollback
+    of the archive creates nothing outside it."""
+    from tools import skill_ledger, skill_usage
+    from tools.skill_manager_tool import skill_manage
+
+    assert _create()["success"] is True
+    wrote = json.loads(skill_manage(action="write_file", name="my-skill",
+                                    file_path="references/extra.md",
+                                    file_content="support file\n"))
+    assert wrote["success"] is True
+    skill_md = ledger_env["skills"] / "my-skill" / "SKILL.md"
+    extra = ledger_env["skills"] / "my-skill" / "references" / "extra.md"
+    _write_skills_tarball(
+        ledger_env["home"],
+        {"my-skill/SKILL.md": skill_md.read_text(encoding="utf-8"),
+         "my-skill/references/extra.md": "support file"},
+    )
+
+    tok = skill_ledger.set_ledger_actor("curator")
+    try:
+        ok, msg = skill_usage.archive_skill("my-skill")
+    finally:
+        skill_ledger.reset_ledger_actor(tok)
+    assert ok, msg
+
+    archived = [r for r in skill_ledger.list_entries("my-skill")
+                if r["action"] == "archive"][0]
+    before_paths = {Path(i["path"]) for i in archived["before"]}
+    assert before_paths == {skill_md, extra}, before_paths
+
+    ok, msg = skill_ledger.rollback_entry(archived["id"])
+    assert ok is True, msg
+    assert skill_md.is_file() and extra.is_file()
+    assert not (ledger_env["skills"] / "SKILL.md").exists()
+    assert not (ledger_env["skills"] / "references").exists()
+
+
+def test_fill_with_missing_root_category_tar_stays_under_the_category(ledger_env):
+    """R1 missing-root + the real ``<category>/<skill>/…`` tar shape: when the destination is
+    the skills root, the full tar path IS the on-disk relative path — no package-prefix
+    stripping, no skills/SKILL.md phantom, and the missing support file lands inside the
+    package under its category."""
+    from tools import skill_ledger
+
+    pkg = _categorised_pkg(ledger_env)
+    skill_md = pkg / "SKILL.md"
+    skill_md.write_text(VALID_SKILL_CONTENT, encoding="utf-8")
+    _write_skills_tarball(
+        ledger_env["home"],
+        {"personal-infra/my-skill/SKILL.md": VALID_SKILL_CONTENT,
+         "personal-infra/my-skill/references/extra.md": "from tar"},
+    )
+
+    # Pre-captured before list with the support file already re-homed off disk.
+    before = skill_ledger.snapshot_paths(pkg)
+    assert [i["path"] for i in before] == [str(skill_md)]
+    filled = skill_ledger.fill_snapshot_from_curator_backup(None, before, skill="my-skill")
+    paths = {Path(i["path"]) for i in filled}
+    assert paths == {skill_md, pkg / "references" / "extra.md"}, paths
 
 
 def test_rollback_historical_hollow_entry_restores_full_package(ledger_env):
@@ -486,6 +588,41 @@ def test_rollback_historical_hollow_entry_restores_full_package(ledger_env):
     assert skill_md.is_file()
     assert roadmap.is_file(), "hollow rollback: support file not restored"
     assert roadmap.read_text(encoding="utf-8") == "week 1"
+
+
+def test_rollback_hollow_categorised_entry_restores_under_the_category(ledger_env):
+    """R1 missing-root recovery with the category-prefixed tar: a hollow historical delete of
+    a categorised package fills from the backup and restores exactly the package paths
+    (``skills/<category>/<skill>/…``) — never a bare twin, never skills/SKILL.md."""
+    from tools import skill_ledger
+
+    skill_dir = _categorised_pkg(ledger_env)
+    skill_md = skill_dir / "SKILL.md"
+    skill_md.write_text(VALID_SKILL_CONTENT, encoding="utf-8")
+    _write_skills_tarball(
+        ledger_env["home"],
+        {"personal-infra/my-skill/SKILL.md": VALID_SKILL_CONTENT,
+         "personal-infra/my-skill/references/roadmap.md": "week 1"},
+    )
+    skill_md.unlink()
+    skill_dir.rmdir()
+
+    entry_id = skill_ledger.append_entry(
+        "delete", "my-skill",
+        before=[{"path": str(skill_md),
+                 "sha256": skill_ledger._store_blob(VALID_SKILL_CONTENT.encode("utf-8"))}],
+        after=[],
+    )
+    assert entry_id is not None
+
+    ok, msg = skill_ledger.rollback_entry(entry_id)
+    assert ok is True, msg
+    assert skill_md.is_file()
+    roadmap = skill_dir / "references" / "roadmap.md"
+    assert roadmap.is_file(), "hollow categorised rollback: support file not restored"
+    assert roadmap.read_text(encoding="utf-8") == "week 1"
+    assert not (ledger_env["skills"] / "my-skill").exists()
+    assert not (ledger_env["skills"] / "SKILL.md").exists()
 
 
 def test_delete_rollback_without_backup_still_works(ledger_env):
@@ -936,6 +1073,220 @@ def test_chain_break_two_process_interleave_is_unverified(ledger_env):
 
 
 # ---------------------------------------------------------------------------
+def test_chain_break_cold_process_interleave_with_live_writer_is_unverified(ledger_env):
+    """R2 acceptance, rejection control: a COLD writer racing a live writer. Process S
+    seeds the ledger+sidecar in a real process; A (this process — no in-memory record)
+    captures; B (real process) appends between A's capture and A's append. A must write
+    "unverified", never `true`. The round-1 shape adopted B's post-capture sidecar and
+    certified true/freshness for exactly this interleave."""
+    import os
+    import subprocess
+    import sys
+
+    from tools import skill_ledger
+
+    repo_root = Path(__file__).resolve().parents[2]
+    pkg = ledger_env["skills"] / "my-skill"
+    pkg.mkdir()
+    skill_md = pkg / "SKILL.md"
+    skill_md.write_text(VALID_SKILL_CONTENT, encoding="utf-8")
+    py_path_var = "PYTHON" + "PATH"  # split literal; same env var, no whole token
+    env = dict(os.environ, HERMES_HOME=str(ledger_env["home"]),
+                **{py_path_var: str(repo_root)})
+    seed = (
+        "import json\n"
+        "from tools import skill_ledger\n"
+        "p = " + repr(str(skill_md)) + "\n"
+        "with open(p, 'rb') as fh:\n"
+        "    data = fh.read()\n"
+        "eid = skill_ledger.append_entry('create', 'my-skill', before=[], "
+        "after=[{'path': p, 'sha256': skill_ledger._store_blob(data)}])\n"
+        "print(json.dumps({'id': eid}))\n"
+    )
+    seed_proc = subprocess.run([sys.executable, "-c", seed], cwd=str(repo_root),
+                               env=env, capture_output=True, text=True, timeout=180)
+    assert seed_proc.returncode == 0, (seed_proc.stdout, seed_proc.stderr)
+    assert skill_ledger._chain_memory.get("my-skill") is None  # A is cold
+
+    # A captures the drifted package (plain capture — the flip control runs on the
+    # round-1 API too).
+    (pkg / "SKILL.md").write_text(DRIFTED_SKILL_CONTENT, encoding="utf-8")
+    before = skill_ledger.capture_before(pkg)
+    assert before is not None
+
+    # B: a real second process appends its own entry — between A's capture and A's append.
+    b_code = (
+        "import json\n"
+        "from tools import skill_ledger\n"
+        "eid = skill_ledger.append_entry('patch', 'my-skill', before=[], after=[])\n"
+        "print(json.dumps({'id': eid}))\n"
+    )
+    b_proc = subprocess.run([sys.executable, "-c", b_code], cwd=str(repo_root),
+                            env=env, capture_output=True, text=True, timeout=180)
+    assert b_proc.returncode == 0, (b_proc.stdout, b_proc.stderr)
+    b_id = json.loads(b_proc.stdout.strip().splitlines()[-1])["id"]
+    assert b_id and skill_ledger.get_entry(b_id) is not None  # B really appended
+
+    entry_id = skill_ledger.record_mutation("patch", "my-skill", before=before,
+                                                 after_root=pkg)
+    assert entry_id is not None
+    entry = skill_ledger.get_entry(entry_id)
+    assert entry["chain_break"] == "unverified", entry
+    assert entry["chain_break"] is not True
+
+
+def test_chain_break_cold_capture_basis_interleave_is_unverified(ledger_env):
+    """R2 acceptance, production threaded path: the capture-time basis pin. A seeds the
+    sidecar in a REAL process and is cold; A's capture pins the basis; a real B appends
+    between capture and append. The pinned basis id no longer matches the tail ->
+    "unverified" (stale-sidecar) with exactly the real drift path, never `true`."""
+    import os
+    import subprocess
+    import sys
+
+    from tools import skill_ledger
+
+    repo_root = Path(__file__).resolve().parents[2]
+    pkg = ledger_env["skills"] / "my-skill"
+    pkg.mkdir()
+    skill_md = pkg / "SKILL.md"
+    skill_md.write_text(VALID_SKILL_CONTENT, encoding="utf-8")
+    py_path_var = "PYTHON" + "PATH"  # split literal; same env var, no whole token
+    env = dict(os.environ, HERMES_HOME=str(ledger_env["home"]),
+                **{py_path_var: str(repo_root)})
+    seed = (
+        "import json\n"
+        "from tools import skill_ledger\n"
+        "p = " + repr(str(skill_md)) + "\n"
+        "with open(p, 'rb') as fh:\n"
+        "    data = fh.read()\n"
+        "eid = skill_ledger.append_entry('create', 'my-skill', before=[], "
+        "after=[{'path': p, 'sha256': skill_ledger._store_blob(data)}])\n"
+        "print(json.dumps({'id': eid}))\n"
+    )
+    seed_proc = subprocess.run([sys.executable, "-c", seed], cwd=str(repo_root),
+                               env=env, capture_output=True, text=True, timeout=180)
+    assert seed_proc.returncode == 0, (seed_proc.stdout, seed_proc.stderr)
+    seed_id = json.loads(seed_proc.stdout.strip().splitlines()[-1])["id"]
+    assert skill_ledger._chain_memory.get("my-skill") is None  # A is cold
+
+    (pkg / "SKILL.md").write_text(DRIFTED_SKILL_CONTENT, encoding="utf-8")
+    before, basis = skill_ledger.capture_before_with_basis(pkg, skill="my-skill")
+    assert before is not None
+    assert basis is not None
+    assert basis.get("sidecar_id") == seed_id, basis  # pinned BEFORE B runs
+
+    b_code = (
+        "import json\n"
+        "from tools import skill_ledger\n"
+        "eid = skill_ledger.append_entry('patch', 'my-skill', before=[], after=[])\n"
+        "print(json.dumps({'id': eid}))\n"
+    )
+    b_proc = subprocess.run([sys.executable, "-c", b_code], cwd=str(repo_root),
+                            env=env, capture_output=True, text=True, timeout=180)
+    assert b_proc.returncode == 0, (b_proc.stdout, b_proc.stderr)
+    b_id = json.loads(b_proc.stdout.strip().splitlines()[-1])["id"]
+    assert b_id and b_id != seed_id  # B appended AFTER A's capture
+
+    entry_id = skill_ledger.record_mutation("patch", "my-skill", before=before,
+                                                 after_root=pkg, chain_basis=basis)
+    assert entry_id is not None
+    entry = skill_ledger.get_entry(entry_id)
+    assert entry["chain_break"] == "unverified", entry
+    assert entry["chain_break_basis"] == "stale-sidecar", entry
+    assert entry["chain_break_paths"] == ["SKILL.md"], entry
+    assert entry["chain_break"] is not True
+
+
+def test_chain_break_cold_process_no_interleave_certifies_through_the_pin(ledger_env):
+    """R2 positive control for the cold path: the same cold capture with NO second writer
+    keeps its certification — the capture-time sidecar pin is a live, fresh basis."""
+    import os
+    import subprocess
+    import sys
+
+    from tools import skill_ledger
+
+    repo_root = Path(__file__).resolve().parents[2]
+    pkg = ledger_env["skills"] / "my-skill"
+    pkg.mkdir()
+    skill_md = pkg / "SKILL.md"
+    skill_md.write_text(VALID_SKILL_CONTENT, encoding="utf-8")
+    py_path_var = "PYTHON" + "PATH"  # split literal; same env var, no whole token
+    env = dict(os.environ, HERMES_HOME=str(ledger_env["home"]),
+                **{py_path_var: str(repo_root)})
+    seed = (
+        "import json\n"
+        "from tools import skill_ledger\n"
+        "p = " + repr(str(skill_md)) + "\n"
+        "with open(p, 'rb') as fh:\n"
+        "    data = fh.read()\n"
+        "eid = skill_ledger.append_entry('create', 'my-skill', before=[], "
+        "after=[{'path': p, 'sha256': skill_ledger._store_blob(data)}])\n"
+        "print(json.dumps({'id': eid}))\n"
+    )
+    seed_proc = subprocess.run([sys.executable, "-c", seed], cwd=str(repo_root),
+                               env=env, capture_output=True, text=True, timeout=180)
+    assert seed_proc.returncode == 0, (seed_proc.stdout, seed_proc.stderr)
+    assert skill_ledger._chain_memory.get("my-skill") is None
+
+    (pkg / "SKILL.md").write_text(DRIFTED_SKILL_CONTENT, encoding="utf-8")
+    before, basis = skill_ledger.capture_before_with_basis(pkg, skill="my-skill")
+    assert before is not None and basis is not None
+
+    entry_id = skill_ledger.record_mutation("patch", "my-skill", before=before,
+                                                 after_root=pkg, chain_basis=basis)
+    assert entry_id is not None
+    entry = skill_ledger.get_entry(entry_id)
+    assert entry["chain_break"] is True, entry
+    assert entry["chain_break_basis"] == "freshness", entry
+    assert entry["chain_break_paths"] == ["SKILL.md"], entry
+
+
+def test_direct_append_cold_process_never_adopts_the_sidecar(ledger_env):
+    """R2 conservative branch: a cold DIRECT append_entry caller has no capture-pinned
+    provenance, so it must write "unverified"/no-sidecar even though a valid sidecar
+    record for the package is on disk — the round-1 shape read the sidecar post-write
+    and issued a verdict here."""
+    import os
+    import subprocess
+    import sys
+
+    from tools import skill_ledger
+
+    repo_root = Path(__file__).resolve().parents[2]
+    pkg = ledger_env["skills"] / "my-skill"
+    pkg.mkdir()
+    skill_md = pkg / "SKILL.md"
+    skill_md.write_text(VALID_SKILL_CONTENT, encoding="utf-8")
+    py_path_var = "PYTHON" + "PATH"  # split literal; same env var, no whole token
+    env = dict(os.environ, HERMES_HOME=str(ledger_env["home"]),
+                **{py_path_var: str(repo_root)})
+    seed = (
+        "import json\n"
+        "from tools import skill_ledger\n"
+        "p = " + repr(str(skill_md)) + "\n"
+        "with open(p, 'rb') as fh:\n"
+        "    data = fh.read()\n"
+        "eid = skill_ledger.append_entry('create', 'my-skill', before=[], "
+        "after=[{'path': p, 'sha256': skill_ledger._store_blob(data)}])\n"
+        "print(json.dumps({'id': eid}))\n"
+    )
+    seed_proc = subprocess.run([sys.executable, "-c", seed], cwd=str(repo_root),
+                               env=env, capture_output=True, text=True, timeout=180)
+    assert seed_proc.returncode == 0, (seed_proc.stdout, seed_proc.stderr)
+    assert skill_ledger._chain_memory.get("my-skill") is None
+    status, packages = skill_ledger._read_chain_sidecar()
+    assert status == "ok" and "my-skill" in packages, "precondition: valid sidecar record"
+
+    entry_id = skill_ledger.append_entry("patch", "my-skill", before=[], after=[])
+    assert entry_id is not None
+    entry = skill_ledger.get_entry(entry_id)
+    assert entry["chain_break"] == "unverified", entry
+    assert entry["chain_break_basis"] == "no-sidecar", entry
+    assert entry["chain_break"] is not True
+    assert entry["chain_break"] is not False
+
 # `skills.write_guard` (optional, off by default — WARNING only, never a refusal)
 # ---------------------------------------------------------------------------
 

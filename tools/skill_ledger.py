@@ -20,6 +20,12 @@ and would only mask the intra-process case while appearing to fix the cross-proc
 writers on one package can therefore still interleave; the freshness read reports the result as
 ``"unverified"`` rather than a false verdict, and an append landing after that read is a
 documented residual (a stale-tail read cannot observe an append that has not happened yet).
+
+The comparison basis is pinned at capture time and threaded to the append (``chain_basis``):
+a sidecar record written by a concurrent writer after that capture fails the freshness check
+and degrades the outcome to ``"unverified"``. A cold process adopts the durable sidecar only
+through a capture (``capture_before_with_basis`` → ``record_mutation``/``append_entry``); a
+direct ``append_entry`` without a pin never adopts it post-write.
 """
 
 from __future__ import annotations
@@ -300,9 +306,13 @@ def fill_snapshot_from_curator_backup(
     """Union missing skill-package files from the newest curator snapshot. Completeness fill, not
     a gate: failures return *existing* unchanged, and only ABSENT paths are filled. Fill targets go
     where rollback must restore them: under *root* when known (for purge that is
-    ``.archive/<name>/``, NOT the live tree), else the live skills dir; the tar's leading
-    package-dir prefix is stripped (see ``_tar_relative_parts``). Every target must stay
-    under ``skills/`` and HERMES_HOME."""
+    ``.archive/<name>/``, NOT the live tree), else the live skills dir. When *root* names the
+    package dir the tar's leading package prefix is stripped (longest match — see
+    ``_tar_relative_parts``), so a ``<category>/<skill>/…`` member lands inside the package
+    instead of as a category-duplicated twin; when *root* is missing (the destination IS the
+    skills root) the full skills-relative tar path is kept — stripping the package segment
+    there fabricates targets like ``skills/SKILL.md`` outside the package, and rollback really
+    wrote them (R1). Every target must stay under ``skills/`` and HERMES_HOME."""
     out = list(existing or [])
     prefixes = package_prefixes(root, skill, out)
     if not prefixes:
@@ -321,7 +331,14 @@ def fill_snapshot_from_curator_backup(
     for rel, data in extra.items():
         if is_artefact(rel):
             continue  # same artefact rule as snapshot_paths, so the maps stay comparable
-        parts = _tar_relative_parts(rel, prefixes, pkg_names)
+        if dest_root is not None:
+            parts = _tar_relative_parts(rel, prefixes, pkg_names)
+        else:
+            # Missing-root semantics (R1): the destination IS the skills root, so the tar's
+            # skills-relative path is the on-disk relative path. Stripping the package segment
+            # here fabricated skills/SKILL.md-style targets outside the package — rollback
+            # restored 4 files where the pre-change code restored the 2 package files.
+            parts = [p for p in rel.split("/") if p]
         if not parts:
             continue
         dest = (dest_root if dest_root is not None else skills).joinpath(*parts)
@@ -348,6 +365,28 @@ def chain_sidecar_path() -> Path:
 # Threads share it; separate processes do not (that is what the sidecar is for).
 _chain_memory: Dict[str, Dict[str, Any]] = {}
 _chain_lock = threading.RLock()
+
+
+def _chain_basis_snapshot(key: str) -> Dict[str, Any]:
+    """The comparison-basis provenance resolved at CAPTURE time, mirroring
+    ``resolve_basis`` at that instant: the warm in-memory record when this process has one
+    for *key*, otherwise the durable sidecar record for *key* with its readability status.
+    Thrown away when the capture fails. The values are facts as of the capture — nothing is
+    re-read later from the sidecar, so a record adopted by a concurrent writer's append
+    after this snapshot can never serve as this entry's comparison basis (R2)."""
+    with _chain_lock:
+        record = _chain_memory.get(key)
+    if isinstance(record, dict) and (record.get("map") is not None or record.get("id") is not None):
+        return {"memory_map": record.get("map"), "memory_id": record.get("id")}
+    status, packages = _read_chain_sidecar()
+    if status == "ok" and isinstance(packages, dict):
+        record = packages.get(key)
+        if isinstance(record, dict):
+            sidecar_map = record.get("map") if isinstance(record.get("map"), dict) else None
+            return {"sidecar_map": sidecar_map, "sidecar_id": record.get("id"),
+                    "sidecar_readable": True}
+        return {"sidecar_map": None, "sidecar_id": None, "sidecar_readable": True}
+    return {"sidecar_map": None, "sidecar_id": None, "sidecar_readable": False}
 
 
 def _read_chain_sidecar() -> Tuple[str, Dict[str, Any]]:
@@ -455,17 +494,34 @@ def _entry_package_root(*manifests: Optional[List[Dict[str, str]]]) -> Optional[
 
 
 def _package_key(root: Optional[Path], skill: Optional[str]) -> str:
-    """Stable per-package key for the in-memory record and the sidecar."""
+    """Stable per-package key for the in-memory record and the sidecar.
+
+    Resolution order: the live skills/-relative location, the skill NAME, the package dir
+    NAME with any archive timestamp stripped (an archive root has no skills/-relative form
+    and the caller may not know the name), else the unknown-package marker. Capture and
+    append MUST resolve the same key for the same package, or a capture-time basis pin
+    would miss the record the append later compares against (restore from .archive/)."""
     rel = _package_rel(root) if root is not None else None
-    return rel or (skill or "").strip() or "?"
+    return (rel or (skill or "").strip()
+            or (_strip_archive_timestamp(root.name) if root is not None else "")
+            or "?")
 
 
-def _annotate_chain_break(entry: Dict[str, Any]) -> Tuple[str, Dict[str, str]]:
+def _annotate_chain_break(
+    entry: Dict[str, Any], chain_basis: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, Dict[str, str]]:
     """Add ``chain_break`` / ``chain_break_basis`` / ``chain_break_paths`` to *entry* in place.
 
     Returns ``(package_key, normalised after map)`` so the caller can update the in-memory
     record and the sidecar *after* the append (contract ordering, §8.1). Failure is never
     propagated: any exception leaves whatever the default keys already say.
+
+    The comparison basis comes from *chain_basis* — the capture-time snapshot made by
+    ``capture_before_with_basis``/``record_mutation`` — when one was threaded through.
+    Without a pin only this process's own warm in-memory record may serve as a basis: the
+    durable sidecar is deliberately NOT adopted fresh after the write, because a cold writer
+    reading it now could pick up another writer's post-capture record and certify a
+    pre-freshness-read interleave as ``true``/``false`` instead of ``"unverified"`` (R2).
     """
     before, after = entry.get("before"), entry.get("after")
     root = _entry_package_root(before, after)
@@ -475,21 +531,27 @@ def _annotate_chain_break(entry: Dict[str, Any]) -> Tuple[str, Dict[str, str]]:
     after_norm = _normalise_map(after, _entry_package_root(after) or root)
     key = _package_key(root, entry.get("skill"))
 
-    memory_map = memory_id = None
-    with _chain_lock:
-        record = _chain_memory.get(key)
-    if isinstance(record, dict):
-        memory_map, memory_id = record.get("map"), record.get("id")
-
-    sidecar_map = sidecar_id = None
+    memory_map = memory_id = sidecar_map = sidecar_id = None
     sidecar_readable = False
-    if memory_map is None and memory_id is None:
-        status, packages = _read_chain_sidecar()
-        sidecar_readable = status == "ok"
-        record = packages.get(key) if sidecar_readable else None
+    if isinstance(chain_basis, dict):
+        # Capture-time provenance (R2): the basis was resolved BEFORE the write, so a
+        # sidecar record adopted by a concurrent writer's post-capture append can never be
+        # compared against — its recorded id fails the freshness check below and the
+        # outcome degrades to "unverified"/stale-sidecar instead of a verdict.
+        memory_map, memory_id = chain_basis.get("memory_map"), chain_basis.get("memory_id")
+        if memory_map is None and memory_id is None:
+            sidecar_map = chain_basis.get("sidecar_map")
+            sidecar_id = chain_basis.get("sidecar_id")
+            sidecar_readable = bool(chain_basis.get("sidecar_readable"))
+    else:
+        # No capture pin (direct append_entry callers): this process's own warm record is
+        # still a valid basis (warm-memory precedence; the freshness check below protects
+        # the comparison). The sidecar cannot be adopted after the write (R2) — a cold
+        # direct caller degrades to "unverified"/no-sidecar, never a stale verdict.
+        with _chain_lock:
+            record = _chain_memory.get(key)
         if isinstance(record, dict):
-            sidecar_map = record.get("map") if isinstance(record.get("map"), dict) else None
-            sidecar_id = record.get("id")
+            memory_map, memory_id = record.get("map"), record.get("id")
 
     last_map, recorded_id = resolve_basis(
         memory_map=memory_map, memory_id=memory_id, sidecar_map=sidecar_map,
@@ -517,7 +579,8 @@ def _record_chain_state(key: str, entry_id: str, after_map: Dict[str, str]) -> N
 def append_entry(
     action: str, skill: str, before: Optional[List[Dict[str, str]]] = None,
     after: Optional[List[Dict[str, str]]] = None, actor: Optional[str] = None,
-    evidence: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    evidence: Optional[Dict[str, Any]] = None,
+    chain_basis: Optional[Dict[str, Any]] = None) -> Optional[str]:
     """Append one entry -> id, or None when disabled / write failed (never raises).
 
     Every entry carries the additive ``chain_break`` annotation (one key, three states —
@@ -525,6 +588,11 @@ def append_entry(
     ``before`` map continued this source's last-known ``after`` map on a fresh ledger tail.
     The keys are written with a fail-open default and replaced by the comparison; the
     annotation is telemetry and can neither block nor fail the mutation.
+
+    ``chain_basis`` is the capture-time provenance snapshot from
+    ``capture_before_with_basis`` (or ``record_mutation``'s own capture). When absent, only
+    this process's warm in-memory record may serve as the comparison basis — the sidecar is
+    never adopted post-write (R2).
     """
     if not ledger_enabled():
         return None
@@ -540,7 +608,7 @@ def append_entry(
             "before": before or [], "after": after or []}
         chain_state = None
         with suppress(Exception):
-            chain_state = _annotate_chain_break(entry)
+            chain_state = _annotate_chain_break(entry, chain_basis)
         path = ledger_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "a", encoding="utf-8") as fh:
@@ -557,7 +625,8 @@ def append_entry(
 def record_mutation(
     action: str, skill: str, before_root: Optional[Path] = None,
     before: Optional[List[Dict[str, str]]] = None, after_root: Optional[Path] = None,
-    actor: Optional[str] = None, evidence: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    actor: Optional[str] = None, evidence: Optional[Dict[str, Any]] = None,
+    chain_basis: Optional[Dict[str, Any]] = None) -> Optional[str]:
     """Mutation hook: after-state from *after_root* (before = pre-captured list or captured from
     *before_root*), then append. NEVER raises. delete/archive/purge capture a COMPLETE package
     (filled from the newest curator backup) so rollback never restores a shell."""
@@ -566,11 +635,16 @@ def record_mutation(
     try:
         _complete = action in _PACKAGE_RESTORE_ACTIONS
         if before is None:
+            if chain_basis is None:
+                # Capture-time provenance: resolve the basis BEFORE the capture itself, so
+                # the comparison only ever uses knowledge that predates the captured state.
+                with suppress(Exception):
+                    chain_basis = _chain_basis_snapshot(_package_key(before_root, skill))
             before = snapshot_paths(before_root, complete_package=_complete)
         elif _complete:
             before = fill_snapshot_from_curator_backup(before_root, before, skill=skill)
         return append_entry(action, skill, before=before, after=snapshot_paths(after_root),
-                            actor=actor, evidence=evidence)
+                            actor=actor, evidence=evidence, chain_basis=chain_basis)
     except Exception as e:
         logger.warning("skill_ledger: record_mutation failed (%s) — mutation unaffected", e)
         return None
@@ -580,15 +654,38 @@ def capture_before(
     root: Optional[Path], *, complete_package: bool = False, skill: Optional[str] = None,
 ) -> Optional[List[Dict[str, str]]]:
     """Best-effort pre-mutation capture; None on failure/disabled (pass straight to
-    record_mutation). ``complete_package=True`` for delete/archive/purge."""
+    record_mutation). ``complete_package=True`` for delete/archive/purge. Call
+    ``capture_before_with_basis`` when the append should annotate against a capture-time
+    comparison basis."""
+    return capture_before_with_basis(root, complete_package=complete_package, skill=skill)[0]
+
+
+def capture_before_with_basis(
+    root: Optional[Path], *, complete_package: bool = False, skill: Optional[str] = None,
+) -> Tuple[Optional[List[Dict[str, str]]], Optional[Dict[str, Any]]]:
+    """``capture_before`` + the chain-comparison basis pinned at capture time.
+
+    The basis is resolved BEFORE the file capture, mirroring ``resolve_basis`` at that
+    instant (warm in-memory record first, the durable sidecar only when it is absent). Pass
+    it to ``record_mutation``/``append_entry`` as ``chain_basis`` so the annotation
+    compares against what this source knew at capture — a concurrent writer's sidecar
+    written after that can only make the recorded id fail the freshness check, degrading
+    the outcome to ``"unverified"``, never certifying a stale comparison (R2). When the
+    capture fails the basis is dropped too, so an empty before-map is never annotated
+    against a basis.
+    """
     if not ledger_enabled():
-        return None
+        return None, None
     try:
+        basis = None
+        with suppress(Exception):
+            basis = _chain_basis_snapshot(_package_key(root, skill))
         captured = snapshot_paths(root)
-        return fill_snapshot_from_curator_backup(root, captured, skill=skill) if complete_package else captured
+        return (fill_snapshot_from_curator_backup(root, captured, skill=skill)
+                if complete_package else captured), basis
     except Exception as e:
         logger.warning("skill_ledger: before-capture failed (%s) — mutation unaffected", e)
-        return None
+        return None, None
 
 
 def list_entries(skill: Optional[str] = None, limit: Optional[int] = None) -> List[Dict[str, Any]]:
