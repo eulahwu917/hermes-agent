@@ -71,6 +71,16 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Run outcomes that mean the card is MID-REWORK rather than handed off: a
+# reviewer closed the run with ``kanban_request_changes`` and the card was
+# requeued to the original implementer. That rework is pushed to the SAME branch
+# and PR, so it is not a duplicate-PR risk. Without this exemption an ordinary
+# ``changes_requested`` verdict — which cites the PR for provenance, as verdicts
+# do — froze the card's ready lane for the whole 24h PR window, stalling every
+# rework cycle. Guard 3 has the equivalent escape for a deliberate re-queue after
+# a success; this is the same idea for a reviewer verdict.
+_REWORK_RUN_OUTCOMES = ("changes_requested",)
+
 
 @dataclass
 class DispatchResult:
@@ -1122,6 +1132,58 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
         )
 
 
+def _in_rework_cycle(conn: sqlite3.Connection, task_id: str) -> bool:
+    """True when a reviewer's rework request is the card's most recent verdict.
+
+    ``kanban_request_changes`` closes the reviewer's run with outcome
+    ``changes_requested`` and requeues the card to the original implementer. That
+    rework is pushed to the SAME branch and PR, so the verdict's own citation of
+    that PR is not the duplicate-PR / "repeat worker storm" signal the respawn
+    guard exists to block (upstream ``264e85b3dd``; and upstream ``a235d1917e``
+    already exempts the review lane on exactly this reasoning — a PR URL is often
+    the *input* to the next step, not evidence of duplicate work).
+
+    Decided on PR **identity**, never on timing: the exemption holds only while
+    every PR mentioned on the card was already known *before* the verdict was
+    written (``created_at < verdict_at``). The verdict re-citing that same PR is
+    therefore tolerated however the comment/run write ordering fell, while a
+    **different** pull request — a second PR opened while the card sat in rework —
+    re-arms guard 4 immediately, at any offset, including at the verdict's own
+    timestamp.
+
+    Fail-closed: if the PR appears *only* in the verdict comment and nowhere
+    earlier, the set test cannot be satisfied and the card keeps the ordinary 24h
+    deferral rather than gaining an exemption on an unverifiable premise.
+    """
+    latest = conn.execute(
+        "SELECT outcome, ended_at FROM task_runs "
+        "WHERE task_id = ? AND ended_at IS NOT NULL "
+        "ORDER BY ended_at DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if not latest or latest["outcome"] not in _REWORK_RUN_OUTCOMES:
+        return False
+    verdict_at = int(latest["ended_at"] or 0)
+
+    known_at_verdict = set()
+    seen = set()
+    for c in conn.execute(
+        "SELECT body, created_at FROM task_comments "
+        "WHERE task_id = ? AND created_at >= ?",
+        (task_id, verdict_at - _RESPAWN_GUARD_PR_WINDOW),
+    ).fetchall():
+        urls = set(_RESPAWN_GUARD_PR_URL_RE.findall(c["body"] or ""))
+        if not urls:
+            continue
+        seen |= urls
+        if int(c["created_at"] or 0) < verdict_at:
+            known_at_verdict |= urls
+    if not seen:
+        # No PR is mentioned in the window: guard 4 cannot fire either way.
+        return True
+    return seen <= known_at_verdict
+
+
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
 ) -> Optional[str]:
@@ -1204,13 +1266,18 @@ def check_respawn_guard(
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
-    pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
-    for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
-        (task_id, pr_cutoff),
-    ).fetchall():
-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
-            return "active_pr"
+    #    Exception: when the card is mid-rework (latest run ended with a reviewer
+    #    ``changes_requested``), the verdict comment itself carries the PR URL and
+    #    the rework targets that same PR — so this is not a duplicate-PR signal
+    #    and must not hold the card for the full window. See _in_rework_cycle.
+    if not _in_rework_cycle(conn, task_id):
+        pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
+        for c in conn.execute(
+            "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+            (task_id, pr_cutoff),
+        ).fetchall():
+            if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
+                return "active_pr"
 
     return None
 

@@ -478,6 +478,106 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
         ) == "rate_limit_cooldown"
 
 
+def test_active_pr_guard_released_when_card_is_mid_rework(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``changes_requested`` verdict must not freeze its own rework.
+
+    The verdict comment cites the PR for provenance (as verdicts do), which armed
+    the 24h ``active_pr`` guard on the ready lane and stalled the fix round. A card
+    whose latest run ended with ``changes_requested`` is mid-rework on that SAME
+    PR, so the guard must release it — while a plain PR comment with no verdict
+    still defers as before.
+    """
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(
+        cfgmod, "load_config",
+        lambda *a, **k: {"kanban": {"review_dispatch": True}},
+    )
+    pr_url = "https://github.com/example/repo/pull/7"
+    other_url = "https://github.com/example/repo/pull/8"
+    _now = int(__import__("time").time())
+
+    def _rework_card(conn, title, *, pr_before=None, pr_after=None, verdict_cites=True):
+        """Build a card sitting in the mid-rework state (or a plain PR card when
+        ``verdict_cites``/run state are omitted by the caller)."""
+        tid = kb.create_task(conn, title=title, assignee="worker")
+        with kb.write_txn(conn):
+            if pr_before:
+                conn.execute(
+                    "INSERT INTO task_comments (task_id, author, body, created_at) "
+                    "VALUES (?, 'worker', ?, ?)",
+                    (tid, f"Opened {pr_before} for review.", _now - 120),
+                )
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, outcome, "
+                "started_at, ended_at) VALUES (?, 'reviewer', 'done', "
+                "'changes_requested', ?, ?)",
+                (tid, _now - 5, _now),
+            )
+            if verdict_cites:
+                conn.execute(
+                    "INSERT INTO task_comments (task_id, author, body, created_at) "
+                    "VALUES (?, 'reviewer', ?, ?)",
+                    (tid, f"NOT_APPROVED at {pr_url} — changes requested.", _now),
+                )
+            if pr_after is not None:
+                url, offset, author = pr_after
+                conn.execute(
+                    "INSERT INTO task_comments (task_id, author, body, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (tid, author, f"opened another {url}", _now + offset),
+                )
+        return tid
+
+    with kbc.connect() as conn:
+        # 1. The real case: the implementer cited the PR, then the verdict re-cites
+        #    the SAME PR. Released — however the comment/run ordering fell — and it
+        #    must dispatch.
+        tid = _rework_card(conn, "rework me (same PR)", pr_before=pr_url)
+        assert kbd.check_respawn_guard(conn, tid) is None
+        res = kbd.dispatch_once(conn, dry_run=True)
+        assert tid in [s[0] for s in res.spawned]
+        # State-based, not a countdown: a second evaluation says the same thing.
+        assert kbd.check_respawn_guard(conn, tid) is None
+
+        # 2. Control: a PR-URL comment with NO rework verdict still defers.
+        ctrl = kb.create_task(conn, title="already PRed, no verdict", assignee="worker")
+        kb.add_comment(conn, ctrl, author="worker", body=f"Opened {pr_url} for review.")
+        assert kbd.check_respawn_guard(conn, ctrl) == "active_pr"
+
+        # 3. A DIFFERENT PR, posted inside the first minutes (the gate's finding 1
+        #    counterexample: +300s, different author) must re-arm guard 4.
+        inside = _rework_card(
+            conn, "second PR inside slack",
+            pr_before=pr_url, pr_after=(other_url, 300, "developer"),
+        )
+        assert kbd.check_respawn_guard(conn, inside) == "active_pr"
+        assert kbd.check_respawn_guard(conn, inside) == "active_pr"  # and on a later tick
+
+        # 4. Boundary-ish: a different PR at the same moment as the verdict.
+        at_verdict = _rework_card(
+            conn, "second PR at verdict offset",
+            pr_before=pr_url, pr_after=(other_url, 0, "developer"),
+        )
+        assert kbd.check_respawn_guard(conn, at_verdict) == "active_pr"
+
+        # 5. A different PR an hour later (the original control — still defers).
+        later = _rework_card(
+            conn, "second PR after verdict",
+            pr_before=pr_url, pr_after=(other_url, 3600, "developer"),
+        )
+        assert kbd.check_respawn_guard(conn, later) == "active_pr"
+
+        # 6. Fail-closed: the PR is cited ONLY by the verdict, nowhere earlier, so
+        #    the same-PR premise is unverifiable — keep the ordinary 24h deferral.
+        verdict_only = _rework_card(conn, "verdict is the only citation", pr_before=None)
+        assert kbd.check_respawn_guard(conn, verdict_only) == "active_pr"
+
+
 def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
     kanban_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
