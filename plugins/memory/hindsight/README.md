@@ -71,14 +71,18 @@ Config file: `~/.hermes/hindsight/config.json`
 | `recall_budget` | `mid` | Recall thoroughness: `low` / `mid` / `high` |
 | `recall_prefetch_method` | `recall` | Auto-recall method: `recall` (raw facts) or `reflect` (LLM synthesis) |
 | `recall_max_tokens` | `4096` | Maximum tokens for recall results |
+| `recall_min_scores` | — | Optional server-side score floors for `recall`, for example `{"reranker": 0.0001}`. No numeric default: calibrate this example against your bank and queries. Applies to background recall, `recall_sync`, and the `hindsight_recall` tool, not `reflect`. |
 | `recall_max_input_chars` | `800` | Maximum input query length for auto-recall |
 | `recall_prompt_preamble` | — | Custom preamble for recalled memories in context |
 | `recall_tags` | — | Tags to filter when searching memories |
 | `recall_tags_match` | `any` | Tag matching mode: `any` / `all` / `any_strict` / `all_strict` |
 | `recall_types` | `observation` | Fact types surfaced by recall (both auto-recall and the `hindsight_recall` tool). Comma-separated string or JSON list. **Default narrowed to `observation` only** (see "Behavior change" below). Set to `observation,world,experience` to also include raw facts. |
+| `prefer_observations` | `false` | Prefer observations when recalling mixed observation/raw fact types. It has no effect with the default observation-only `recall_types`. |
 | `auto_recall` | `true` | Automatically recall memories before each turn |
 | `recall_sync` | `false` | Recall synchronously against the *current* message each turn (higher relevance, adds recall latency). Default off: recall runs in the background and is injected on the next turn. |
 | `recall_indicator` | `true` | Show a `👁️ Hindsight — recalled N memories` status line when auto-recall injects memory. Turn off for customer-facing agents. |
+
+Score floors follow [Hindsight's recall semantics](https://hindsight.vectorize.io/developer/api/recall#min_scores): `semantic` and `keyword` restrict their retrieval arms, while `reranker` and `final` filter ranked results. A memory can still arrive through another retrieval arm. A reranker floor does not cap the candidates being scored or guarantee lower latency; tune the server's [reranker candidate limits](https://hindsight.vectorize.io/developer/configuration) separately when needed.
 
 > **Behavior change — `recall_types` defaults to `observation` only.**
 >
@@ -147,4 +151,4 @@ Available in `hybrid` and `tools` memory modes:
 
 ## Client Version
 
-Requires `hindsight-client >= 0.8.5`. The plugin auto-upgrades on session start if an older version is detected.
+Requires `hindsight-client >= 0.8.5, < 0.10`. The plugin installs a supported client on session start when needed; compatible versions such as 0.9.2 are retained. If an upgrade is blocked, the existing version guard warns and omits recall parameters unsupported by the installed client.

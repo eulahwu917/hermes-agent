@@ -50,6 +50,7 @@ from agent.secret_scope import get_secret
 
 from agent.memory_provider import MemoryProvider, RecallStatus
 from hermes_constants import get_hermes_home
+from tools.lazy_deps import feature_specs
 from tools.registry import tool_error
 from hermes_cli.config import cfg_get
 
@@ -71,8 +72,8 @@ class _RecallResult:
 
 _DEFAULT_API_URL = "https://api.hindsight.vectorize.io"
 _DEFAULT_LOCAL_URL = "http://localhost:8888"
-# Keep in sync with tools/lazy_deps.py ("memory.hindsight") and plugin.yaml.
-_MIN_CLIENT_VERSION = "0.8.5"
+# Setup, initialization and lazy loading share one runtime requirement.
+_CLIENT_DEPENDENCY = feature_specs("memory.hindsight")[0]
 _DEFAULT_TIMEOUT = 120  # seconds — cloud API can take 30-40s per request
 _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
 # ``metadata.source`` stamped on retained memories — OPT-IN, empty by default.
@@ -1026,7 +1027,7 @@ class HindsightMemoryProvider(MemoryProvider):
         env_writes: dict = {}
 
         # Step 2: Install/upgrade deps for selected mode
-        cloud_dep = f"hindsight-client>={_MIN_CLIENT_VERSION}"
+        cloud_dep = _CLIENT_DEPENDENCY
         local_dep = "hindsight-all"
         if mode == "local_embedded":
             deps_to_install = [local_dep]
@@ -1649,23 +1650,25 @@ class HindsightMemoryProvider(MemoryProvider):
         # Check client version and auto-upgrade if needed
         try:
             from importlib.metadata import version as pkg_version
+            from packaging.requirements import Requirement
             from packaging.version import Version
             installed = pkg_version("hindsight-client")
-            if Version(installed) < Version(_MIN_CLIENT_VERSION):
-                logger.warning("hindsight-client %s is outdated (need >=%s), attempting upgrade...",
-                               installed, _MIN_CLIENT_VERSION)
+            supported_versions = Requirement(_CLIENT_DEPENDENCY).specifier
+            if Version(installed) not in supported_versions:
+                logger.warning("hindsight-client %s is unsupported (need %s), attempting upgrade...",
+                               installed, _CLIENT_DEPENDENCY)
                 # Environment-aware install: sealed hosted venvs redirect to the
                 # durable data-volume target instead of /opt/hermes (NS-605).
                 from tools.lazy_deps import install_specs
-                outcome = install_specs([f"hindsight-client>={_MIN_CLIENT_VERSION}"], timeout=120)
+                outcome = install_specs([_CLIENT_DEPENDENCY], timeout=120)
                 if outcome.ok:
-                    logger.info("hindsight-client upgraded to >=%s", _MIN_CLIENT_VERSION)
+                    logger.info("hindsight-client upgraded to %s", _CLIENT_DEPENDENCY)
                 elif outcome.blocked:
-                    logger.warning("Auto-upgrade unavailable: %s. Run: uv pip install 'hindsight-client>=%s'",
-                                   outcome.reason, _MIN_CLIENT_VERSION)
+                    logger.warning("Auto-upgrade unavailable: %s. Run: uv pip install %r",
+                                   outcome.reason, _CLIENT_DEPENDENCY)
                 else:
-                    logger.warning("Auto-upgrade failed: %s. Run: uv pip install 'hindsight-client>=%s'",
-                                   (outcome.stderr or "").strip() or "install error", _MIN_CLIENT_VERSION)
+                    logger.warning("Auto-upgrade failed: %s. Run: uv pip install %r",
+                                   (outcome.stderr or "").strip() or "install error", _CLIENT_DEPENDENCY)
         except Exception:
             pass  # packaging not available or other issue — proceed anyway
 
