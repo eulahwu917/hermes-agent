@@ -478,6 +478,86 @@ def test_active_pr_guard_skipped_for_review_lane_but_defers_ready_lane(
         ) == "rate_limit_cooldown"
 
 
+def test_active_pr_guard_released_when_card_is_mid_rework(
+    kanban_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ``changes_requested`` verdict must not freeze its own rework.
+
+    The verdict comment cites the PR for provenance (as verdicts do), which armed
+    the 24h ``active_pr`` guard on the ready lane and stalled the fix round. A card
+    whose latest run ended with ``changes_requested`` is mid-rework on that SAME
+    PR, so the guard must release it — while a plain PR comment with no verdict
+    still defers as before.
+    """
+    import hermes_cli.config as cfgmod
+    import hermes_cli.profiles as profmod
+
+    monkeypatch.setattr(profmod, "profile_exists", lambda name: True)
+    monkeypatch.setattr(
+        cfgmod, "load_config",
+        lambda *a, **k: {"kanban": {"review_dispatch": True}},
+    )
+    pr_url = "https://github.com/example/repo/pull/7"
+
+    with kbc.connect() as conn:
+        # Place the card in the mid-rework state a verdict produces: the run that
+        # ended is the reviewer's, with outcome ``changes_requested``, and the
+        # verdict comment carries the PR URL (provenance, as verdicts do).
+        tid = kb.create_task(conn, title="rework me", assignee="worker")
+        _now = int(__import__("time").time())
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, outcome, "
+                "started_at, ended_at) VALUES (?, 'reviewer', 'done', "
+                "'changes_requested', ?, ?)",
+                (tid, _now - 5, _now),
+            )
+        kb.add_comment(
+            conn, tid, author="reviewer",
+            body=f"NOT_APPROVED at {pr_url} — changes requested.",
+        )
+        latest = conn.execute(
+            "SELECT outcome FROM task_runs WHERE task_id = ? "
+            "ORDER BY ended_at DESC LIMIT 1", (tid,),
+        ).fetchone()
+        assert latest["outcome"] == "changes_requested"
+
+        # Released: the rework round may spawn even though the verdict cites the PR.
+        assert kbd.check_respawn_guard(conn, tid) is None
+        res = kbd.dispatch_once(conn, dry_run=True)
+        assert tid in [s[0] for s in res.spawned]
+
+        # Control: the same PR-URL comment with NO rework verdict still defers.
+        ctrl = kb.create_task(conn, title="already PRed, no verdict", assignee="worker")
+        kb.add_comment(conn, ctrl, author="worker", body=f"Opened {pr_url} for review.")
+        assert kbd.check_respawn_guard(conn, ctrl) == "active_pr"
+
+        # NEW PR word AFTER the verdict — a second pull request opened while the
+        # card sat in rework — must re-arm the guard. The escape is a bounded
+        # exemption for the verdict that cites the PR, not a blanket bypass.
+        later = kb.create_task(conn, title="second PR after verdict", assignee="worker")
+        _t = int(__import__("time").time())
+        with kb.write_txn(conn):
+            conn.execute(
+                "INSERT INTO task_runs (task_id, profile, status, outcome, "
+                "started_at, ended_at) VALUES (?, 'reviewer', 'done', "
+                "'changes_requested', ?, ?)",
+                (later, _t - 5, _t),
+            )
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) "
+                "VALUES (?, 'reviewer', ?, ?)",
+                (later, f"NOT_APPROVED at {pr_url} — changes requested.", _t),
+            )
+            # ...and an hour later, a SECOND PR link.
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) "
+                "VALUES (?, 'worker', ?, ?)",
+                (later, "opened a second one https://github.com/example/repo/pull/8", _t + 3600),
+            )
+        assert kbd.check_respawn_guard(conn, later) == "active_pr"
+
+
 def test_review_dispatch_preserves_task_skills_and_adds_reviewer_skill(
     kanban_home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
