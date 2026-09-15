@@ -1738,7 +1738,10 @@ DEFAULT_CONFIG = {
         "tirith_enabled": True,
         "tirith_path": "tirith",
         "tirith_timeout": 5,
-        "tirith_fail_open": True,
+        "tirith_fail_open": False,  # Fail CLOSED by default: an unavailable scanner blocks
+        # commands with a clear reason instead of silently degrading to pattern matching.
+        # Setting true is the operator's explicit, recorded (config.yaml) acknowledgement
+        # of degraded (pattern-matching-only) operation.
         "website_blocklist": {"enabled": False, "domains": [], "shared_files": []},
         # IDs of supply-chain advisories the user has read and acted on; acked ones stop the startup
         # banner. Add via `hermes doctor --ack <id>`; remove by editing the list. Catalog:

@@ -143,6 +143,43 @@ class TestOSErrorFailOpen:
         assert "fail-closed" in result["summary"]
 
 
+class TestSpawnFailureFailClosedDefault:
+    @patch("tools.tirith_security.subprocess.run")
+    @patch("tools.tirith_security._load_security_config")
+    def test_spawn_failure_blocks_when_fail_open_absent(self, mock_cfg, mock_run):
+        """The hardened default: a cfg without an explicit fail_open key means fail-CLOSED —
+        a missing/broken scanner blocks the command with the acknowledgement hint."""
+        mock_cfg.return_value = {"tirith_enabled": True, "tirith_path": "tirith",
+                                 "tirith_timeout": 5}
+        mock_run.side_effect = FileNotFoundError("No such file: tirith")
+        result = check_command_security("echo hi")
+        assert result["action"] == "block"
+        assert "tirith_fail_open" in result["summary"]
+
+
+class TestCircuitBreakerFailClosed:
+    @patch("tools.tirith_security._load_security_config")
+    def test_open_breaker_blocks_by_default(self, mock_cfg):
+        """A circuit-breakered (repeatedly crashing) scanner used to silently allow every
+        command; with the fail-closed default it blocks with the acknowledgement hint."""
+        mock_cfg.return_value = {"tirith_enabled": True, "tirith_path": "tirith",
+                                 "tirith_timeout": 5}
+        _tirith_mod._circuit_open = True
+        result = check_command_security("echo hi")
+        assert result["action"] == "block"
+        assert "circuit breaker" in result["summary"]
+        assert "tirith_fail_open" in result["summary"]
+
+    @patch("tools.tirith_security._load_security_config")
+    def test_open_breaker_allows_when_acknowledged(self, mock_cfg):
+        mock_cfg.return_value = {"tirith_enabled": True, "tirith_path": "tirith",
+                                 "tirith_timeout": 5, "tirith_fail_open": True}
+        _tirith_mod._circuit_open = True
+        result = check_command_security("echo hi")
+        assert result["action"] == "allow"
+        assert "circuit breaker" in result["summary"]
+
+
 class TestTimeoutFailOpen:
     @patch("tools.tirith_security.subprocess.run")
     @patch("tools.tirith_security._load_security_config")
@@ -316,17 +353,36 @@ class TestUnsupportedPlatform:
 
 
     @patch("tools.tirith_security._load_security_config")
-    def test_check_command_security_unsupported_allows_silently(self, mock_cfg):
-        """Windows: skip the resolver and spawn entirely — return allow with
-        an empty summary so callers can't accidentally surface 'tirith
-        unavailable' messaging to the user."""
+    def test_check_command_security_unsupported_allows_when_acknowledged(self, mock_cfg):
+        """Windows with the operator's explicit acknowledgement (tirith_fail_open: true):
+        the resolver and spawn are still skipped entirely, but the open verdict now carries
+        an informative summary. That messaging cannot surface by accident — the default is
+        fail-closed, so reaching it requires the recorded acknowledgement."""
         mock_cfg.return_value = {"tirith_enabled": True, "tirith_path": "tirith",
                                  "tirith_timeout": 5, "tirith_fail_open": True}
         with patch("tools.tirith_security.is_platform_supported", return_value=False), \
              patch("tools.tirith_security.subprocess.run") as mock_run, \
              patch("tools.tirith_security._resolve_tirith_path") as mock_resolve:
             result = check_command_security("rm -rf /")
-            assert result == {"action": "allow", "findings": [], "summary": ""}
+            assert result["action"] == "allow"
+            assert result["findings"] == []
+            assert result["summary"] == "tirith has no build for this platform"
+            mock_run.assert_not_called()
+            mock_resolve.assert_not_called()
+
+    @patch("tools.tirith_security._load_security_config")
+    def test_check_command_security_unsupported_fail_closed_by_default(self, mock_cfg):
+        """Windows WITHOUT an acknowledgement: no silent degradation — the command is
+        blocked with the acknowledgement hint (tirith_fail_open now defaults to False)."""
+        mock_cfg.return_value = {"tirith_enabled": True, "tirith_path": "tirith",
+                                 "tirith_timeout": 5}  # no fail_open key -> default False
+        with patch("tools.tirith_security.is_platform_supported", return_value=False), \
+             patch("tools.tirith_security.subprocess.run") as mock_run, \
+             patch("tools.tirith_security._resolve_tirith_path") as mock_resolve:
+            result = check_command_security("rm -rf /")
+            assert result["action"] == "block"
+            assert "tirith is not available for this platform" in result["summary"]
+            assert "tirith_fail_open" in result["summary"]
             mock_run.assert_not_called()
             mock_resolve.assert_not_called()
 

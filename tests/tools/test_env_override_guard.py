@@ -1,0 +1,326 @@
+"""Tests for the guard hardening (incident t_0e0ffa24): environmental-override hijack
+detection with tirith parity (R2 static rule; verdicts verified against the tirith 0.3.3
+binary on 2026-09-15), denied-value tracking across executed-script content (R2
+value-following), and re-route events (R3 ledger). Token-spliced spellings are DECLARED
+NON-COVERAGE and asserted untracked (the card forbids chasing them with patterns)."""
+
+import json
+import time
+
+import pytest
+
+import tools.approval as approval_module
+from gateway.session_context import reset_session_vars
+from tools.approval import _Unattended, _unattended_deny
+from tools.approval_detection import (
+    ENV_OVERRIDE_HIJACK_DESCRIPTION,
+    _env_override_hijack_findings,
+    detect_dangerous_command,
+    extract_env_override_assignments,
+    extract_env_override_assignments_from_file,
+    script_files_executed_by_command,
+)
+
+SESSION = "test-session"
+DENIED_VAL = "/srv/personal/scratch/denied/value/path"
+
+
+def _sq_ctx() -> _Unattended:
+    return _Unattended(
+        "single_query", "single_query_mode",
+        "single-query mode (-q) runs without a user present to approve it",
+        "in single-query mode", "this single-query run is intentionally trusted",
+    )
+
+
+@pytest.fixture(autouse=True)
+def _clear_state(monkeypatch):
+    monkeypatch.setenv("HERMES_SESSION_KEY", SESSION)
+    monkeypatch.delenv("HERMES_SINGLE_QUERY_SESSION", raising=False)
+    monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+    monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+    monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+    monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+    monkeypatch.delenv("TIRITH_BIN", raising=False)
+    monkeypatch.delenv("TIRITH_FAIL_OPEN", raising=False)
+    approval_module._denied_env_overrides.clear()
+    approval_module._permanent_approved.clear()
+    reset_session_vars()
+    yield
+    approval_module._denied_env_overrides.clear()
+    reset_session_vars()
+
+
+def _seed_denied(var="PYTHONPATH", value=DENIED_VAL):
+    approval_module._denied_env_overrides[SESSION] = {(var, value): time.time()}
+
+
+def _all_findings(command):
+    return list(_env_override_hijack_findings(command))
+
+
+# ---------------------------------------------------------------------------
+# R2 static rule: tirith interpreter_hijack_env parity
+# ---------------------------------------------------------------------------
+
+class TestEnvOverrideHijackFindings:
+    def test_export_word_form_found(self):
+        assert _all_findings("export PYTHONPATH=/x") == [(ENV_OVERRIDE_HIJACK_DESCRIPTION, "PYTHONPATH")]
+
+    def test_env_assign_word_form_found(self):
+        assert _all_findings("env -u FOO PYTHONPATH=/p python3 -c x") == [
+            (ENV_OVERRIDE_HIJACK_DESCRIPTION, "PYTHONPATH")]
+
+    def test_compound_export_segment_found(self):
+        assert _all_findings("set -u; export PYTHONPATH=/p && python3 -c x") == [
+            (ENV_OVERRIDE_HIJACK_DESCRIPTION, "PYTHONPATH")]
+
+    def test_spaced_form_not_flagged_tirith_parity(self):
+        # tirith 0.3.3 allows this (verified against the binary): the spaced form is not a
+        # POSIX assignment, so flagging it is a false positive.
+        assert _all_findings("export PYTHONPATH = /p") == []
+
+    def test_prefix_assignment_not_flagged_tirith_parity(self):
+        # tirith 0.3.3 allows bare prefix assignments; the fallback mirrors that exactly.
+        assert _all_findings("PYTHONPATH=/x python3 -c foo") == []
+
+    def test_assignment_run_before_env_found_tirith_parity(self):
+        # tirith 0.3.3 blocks this spelling; the fallback must too.
+        assert _all_findings("FOO=1 env PYTHONPATH=/x cmd") == [
+            (ENV_OVERRIDE_HIJACK_DESCRIPTION, "PYTHONPATH")]
+
+    def test_mixed_export_assignments_found_tirith_parity(self):
+        assert _all_findings("export FOO=1 PYTHONPATH=/x") == [
+            (ENV_OVERRIDE_HIJACK_DESCRIPTION, "PYTHONPATH")]
+
+    def test_prefix_after_assignment_run_not_flagged(self):
+        assert _all_findings("FOO=1 PYTHONPATH=/x cmd") == []
+
+    def test_other_variables_not_flagged(self):
+        for cmd in ("export PATH=/x", "export PYTHONHOME=/y", "export LD_PRELOAD=/z",
+                    "env -u X PATH=/p cmd"):
+            assert _all_findings(cmd) == [], cmd
+
+    def test_quoted_data_not_flagged(self):
+        assert _all_findings('echo "PYTHONPATH=/x"') == []
+        assert _all_findings("echo PYTHONPATH=/x") == []
+
+    def test_detect_dangerous_command_integration(self):
+        assert detect_dangerous_command("export PYTHONPATH=/x") == (
+            True, ENV_OVERRIDE_HIJACK_DESCRIPTION, ENV_OVERRIDE_HIJACK_DESCRIPTION)
+        # the -c form trips the pre-existing script-exec-flag rule, so use a clean prefix example
+        assert detect_dangerous_command("PYTHONPATH=/x python3 script.py") == (False, None, None)
+
+
+# ---------------------------------------------------------------------------
+# Value extractors (any plain carrier form)
+# ---------------------------------------------------------------------------
+
+class TestEnvOverrideExtractors:
+    def test_prefix_form_extracted(self):
+        assert extract_env_override_assignments("PYTHONPATH=/a python3 -c x") == [("PYTHONPATH", "/a")]
+
+    def test_multi_prefix_skips_untracked(self):
+        assert extract_env_override_assignments("FOO=1 PYTHONPATH=/a python3 -c x") == [("PYTHONPATH", "/a")]
+
+    def test_export_quoted_value_extracted(self):
+        assert extract_env_override_assignments('export PYTHONPATH="/a b"') == [("PYTHONPATH", "/a b")]
+
+    def test_env_word_extracted(self):
+        assert extract_env_override_assignments("env -u X PYTHONPATH=/a cmd") == [("PYTHONPATH", "/a")]
+
+    def test_compound_segments_extracted(self):
+        assert extract_env_override_assignments("set -u; export PYTHONPATH=/a; echo hi") == [
+            ("PYTHONPATH", "/a")]
+
+    def test_spaced_form_not_extracted_tirith_parity(self):
+        # Not an assignment in POSIX (tirith allows it): extracting it would track a phantom.
+        assert extract_env_override_assignments("export PYTHONPATH = /a") == []
+
+    def test_assignment_run_before_env_extracted(self):
+        assert extract_env_override_assignments("FOO=1 env PYTHONPATH=/a cmd") == [("PYTHONPATH", "/a")]
+
+    def test_prefix_value_after_other_assignment_extracted(self):
+        assert extract_env_override_assignments("FOO=1 PYTHONPATH=/a cmd") == [("PYTHONPATH", "/a")]
+
+    def test_quoted_data_not_extracted(self):
+        assert extract_env_override_assignments('echo "PYTHONPATH=/a"') == []
+
+
+class TestScriptFileScans:
+    @pytest.fixture(autouse=True)
+    def _script(self, tmp_path):
+        self.tmp = tmp_path
+        self.script = tmp_path / "run.sh"
+        self.script.write_text(
+            "#!/usr/bin/env bash\nset -u\nexport PYTHONPATH=%s\necho \"PYTHONPATH=/decoy\"\n" % DENIED_VAL,
+            encoding="utf-8")
+        return self.script
+
+    def test_bash_absolute_path_found(self):
+        assert script_files_executed_by_command(f"bash {self.script}") == [str(self.script)]
+
+    def test_relative_path_resolved_against_cwd(self):
+        assert script_files_executed_by_command("bash run.sh", cwd=str(self.tmp)) == [str(self.script)]
+
+    def test_sh_with_options_found(self):
+        assert script_files_executed_by_command("sh -eu run.sh", cwd=str(self.tmp)) == [str(self.script)]
+
+    def test_dot_slash_found(self):
+        assert script_files_executed_by_command("./run.sh", cwd=str(self.tmp)) == [str(self.script)]
+
+    def test_pipeline_with_redirects_found(self):
+        assert script_files_executed_by_command(
+            "bash run.sh 2>&1 | tail -12 ; echo done", cwd=str(self.tmp)) == [str(self.script)]
+
+    def test_inline_code_flag_yields_no_file(self):
+        assert script_files_executed_by_command("bash -c 'export PYTHONPATH=/x'", cwd=str(self.tmp)) == []
+
+    def test_missing_file_absent(self):
+        assert script_files_executed_by_command("bash nope-missing.sh", cwd=str(self.tmp)) == []
+
+    def test_oversized_file_not_scanned(self):
+        big = self.tmp / "big.sh"
+        big.write_bytes(b"#!/bin/sh\n" + b"#" * (300 * 1024))
+        assert script_files_executed_by_command("bash big.sh", cwd=str(self.tmp)) == []
+
+    def test_file_content_extraction(self):
+        assert extract_env_override_assignments_from_file(str(self.script)) == [("PYTHONPATH", DENIED_VAL)]
+
+    def test_file_content_skips_decoy_echo_and_comments(self):
+        p = self.tmp / "clean.sh"
+        p.write_text(
+            "# export PYTHONPATH=/commented\necho \"PYTHONPATH=/echod\"\nexport PYTHONPATH=/real\n",
+            encoding="utf-8")
+        assert extract_env_override_assignments_from_file(str(p)) == [("PYTHONPATH", "/real")]
+
+    def test_file_content_spaced_form_not_extracted(self):
+        p = self.tmp / "spaced.sh"
+        p.write_text("export PYTHONPATH = /spaced\n", encoding="utf-8")
+        assert extract_env_override_assignments_from_file(str(p)) == []
+
+
+# ---------------------------------------------------------------------------
+# R2 denied-value tracking + R3 events
+# ---------------------------------------------------------------------------
+
+class TestDeniedValueTracking:
+    @pytest.fixture(autouse=True)
+    def _cfg_deny(self, monkeypatch):
+        import hermes_cli.config as config_mod
+        monkeypatch.setattr(config_mod, "load_config_readonly", lambda: {"approvals": {}})
+
+    def test_recurrence_found_in_executed_script(self, tmp_path):
+        script = tmp_path / "carry.sh"
+        script.write_text(f"export PYTHONPATH={DENIED_VAL}\n", encoding="utf-8")
+        _seed_denied()
+        recurring = approval_module._reappearing_denied_overrides(
+            "bash carry.sh", cwd=str(tmp_path))
+        assert recurring == [("PYTHONPATH", DENIED_VAL, str(script))]
+
+    def test_recurrence_found_in_command_text(self):
+        _seed_denied()
+        recurring = approval_module._reappearing_denied_overrides(
+            f"env PYTHONPATH={DENIED_VAL} python3 -c x")
+        assert recurring == [("PYTHONPATH", DENIED_VAL, "command")]
+
+    def test_ttl_expiry_clears_denial(self):
+        _seed_denied()
+        approval_module._denied_env_overrides[SESSION][("PYTHONPATH", DENIED_VAL)] = time.time() - 4000
+        assert approval_module._recently_denied_env_overrides(SESSION) == []
+
+    def test_unattended_carryover_blocked(self, tmp_path):
+        script = tmp_path / "carry.sh"
+        script.write_text(f"export PYTHONPATH={DENIED_VAL}\n", encoding="utf-8")
+        _seed_denied()
+        result = _unattended_deny(f"bash {script}", _sq_ctx())
+        assert result is not None and result["approved"] is False
+        assert "denied earlier in this session" in result["message"]
+        assert DENIED_VAL in result["message"]
+        assert str(script) in result["message"]
+
+    def test_no_prior_denial_no_carryover_block(self, tmp_path):
+        script = tmp_path / "carry.sh"
+        script.write_text(f"export PYTHONPATH={DENIED_VAL}\n", encoding="utf-8")
+        assert _unattended_deny(f"bash {script}", _sq_ctx()) is None
+
+    def test_token_spliced_spelling_declared_non_coverage(self, tmp_path):
+        script = tmp_path / "spliced.sh"
+        script.write_text("export PYTH\"+\"PATH=/x\n", encoding="utf-8")
+        assert extract_env_override_assignments_from_file(str(script)) == []
+        _seed_denied(value="/x")
+        recurring = approval_module._reappearing_denied_overrides(
+            "bash spliced.sh", cwd=str(tmp_path))
+        assert recurring == []
+
+
+class TestGuardEventLedger:
+    def test_event_written_to_ledger(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        approval_module._record_guard_event(
+            "denied", SESSION, var="PYTHONPATH", value="/v", outcome="blocked", command="cmd")
+        ledger = tmp_path / "security" / "guard_events.jsonl"
+        assert ledger.exists()
+        rows = [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines()]
+        row = rows[0]
+        assert row["kind"] == "denied" and row["session"] == SESSION
+        assert row["var"] == "PYTHONPATH" and row["value"] == "/v"
+        assert row["outcome"] == "blocked"
+
+    def test_carryover_event_on_admitted_fast_path(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        script = tmp_path / "admit.sh"
+        script.write_text(f"export PYTHONPATH={DENIED_VAL}\n", encoding="utf-8")
+        _seed_denied()
+        verdict = approval_module._approved_with_carryover_watch("bash admit.sh", str(tmp_path))
+        assert verdict.get("approved") is True
+        ledger = tmp_path / "security" / "guard_events.jsonl"
+        rows = [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines()]
+        carry = next(r for r in rows if r["kind"] == "carryover")
+        assert carry["outcome"] == "admitted"
+        assert carry["source"] == str(script)
+        assert carry["value"] == DENIED_VAL
+
+    def test_remember_denied_persists_and_emits(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        approval_module._remember_denied_env_override(f"env PYTHONPATH={DENIED_VAL} python3 -c x")
+        assert ("PYTHONPATH", DENIED_VAL) in approval_module._recently_denied_env_overrides(SESSION)
+        ledger = tmp_path / "security" / "guard_events.jsonl"
+        assert ledger.exists()
+        rows = [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines()]
+        assert any(r["kind"] == "denied" and r["value"] == DENIED_VAL for r in rows)
+
+
+class TestFullGateIntegration:
+    """check_all_command_guards end-to-end under single-query deny, scanner allow-mocked."""
+
+    @pytest.fixture(autouse=True)
+    def _env(self, monkeypatch):
+        import hermes_cli.config as config_mod
+        import tools.tirith_security as tirith_mod
+        monkeypatch.setattr(config_mod, "load_config_readonly", lambda: {"approvals": {}})
+        monkeypatch.setattr(tirith_mod, "check_command_security",
+                            lambda command: {"action": "allow", "findings": [], "summary": ""})
+        monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
+
+    def test_static_pattern_blocks_export_form(self):
+        result = approval_module.check_all_command_guards("export PYTHONPATH=/x", "local")
+        assert result["approved"] is False
+        assert ENV_OVERRIDE_HIJACK_DESCRIPTION in result["message"]
+
+    def test_prefix_form_passes_without_prior_denial_tirith_parity(self):
+        result = approval_module.check_all_command_guards("PYTHONPATH=/x python3 script.py", "local")
+        assert result["approved"] is True
+
+    def test_script_carrying_denied_value_blocked(self, tmp_path):
+        script = tmp_path / "run_task.sh"
+        script.write_text(f"export PYTHONPATH={DENIED_VAL}\n", encoding="utf-8")
+        # deny the inline form first (exactly the incident sequence), then execute the script
+        first = approval_module.check_all_command_guards(
+            f"env PYTHONPATH={DENIED_VAL} python3 -m somepkg --flag", "local")
+        assert first["approved"] is False
+        second = approval_module.check_all_command_guards(
+            "bash run_task.sh", "local", command_cwd=str(tmp_path))
+        assert second["approved"] is False
+        assert "denied earlier in this session" in second["message"]
+        assert DENIED_VAL in second["message"] and str(script) in second["message"]

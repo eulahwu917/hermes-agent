@@ -988,6 +988,196 @@ def _execution_flag_findings(command: str):
                         yield (f"arbitrary program execution via {executable_name} {finding[0]}", finding[1])
 
 
+# --- Environment-override hijack detection (tirith ``interpreter_hijack_env`` parity) ----------------------------
+# The incident enabler pair: inline ``PYTHONPATH=…`` denied by tirith, then the SAME VALUE carried inside an
+# executed script while the scanner was degraded. This layer gives the pattern fallback a tirith-parity static
+# rule for the construct, plus extractors the guard uses to track a denied override by VALUE across spellings
+# (command text and executed-script content).
+#
+# Parity verified against the tirith 0.3.3 binary (~/.hermes/bin/tirith) on 2026-09-15:
+#   BLOCK  export PYTHONPATH=v | env [opts] PYTHONPATH=v cmd | FOO=1 env PYTHONPATH=v cmd | export FOO=1 PYTHONPATH=v
+#   ALLOW  PYTHONPATH=v cmd (bare prefix assignment) | export PYTHONPATH = v (not a POSIX assignment) | export PYTHONHOME=v
+# Declared non-coverage (by design, per incident card): token-splicing obfuscation (PYTH"+"PATH) is deliberately
+# NOT chased (arms race with false-positive cost), and ``sh -c`` inline-code payloads are not content-scanned here
+# (the pre-existing pattern rule already denies -c/-e code execution in deny mode; interactive mode exposes the
+# payload to the human via the approval prompt).
+_ENV_HIJACK_VARS = ("PYTHONPATH",)
+ENV_OVERRIDE_HIJACK_DESCRIPTION = "interpreter-hijack environment variable assignment (PYTHONPATH)"
+_SHELL_SCRIPT_EXECUTABLES = frozenset({"bash", "sh", "zsh", "ksh", "dash", "fish", "ash", "source", "."})
+_SHELL_INLINE_CODE_FLAGS = frozenset({"-c", "-lc", "-e", "--command"})
+_SCRIPT_SCAN_MAX_BYTES = 256 * 1024
+_SCRIPT_SCAN_MAX_LINES = 4000
+
+
+def _is_env_assignment_token(token: str) -> tuple[str, str] | None:
+    """``NAME=value`` word -> (name, value) with shell-plausible NAME and non-empty value."""
+    name, sep, value = token.partition("=")
+    if not sep or not value:
+        return None
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+        return None
+    return name, value
+
+
+def _assignment_pairs_from_tokens(tokens: list) -> list:
+    """Tracked (var, value) pairs from ``export``/``env`` argument tokens (``NAME=value`` form).
+    The spaced ``NAME = value`` form is deliberately NOT treated as an assignment: it is not one
+    in POSIX, and tirith 0.3.3 allows it (verified empirically) — flagging it is a false positive."""
+    pairs = []
+    for token in tokens:
+        m = _is_env_assignment_token(token)
+        if m is not None and m[0] in _ENV_HIJACK_VARS:
+            pairs.append(m)
+    return pairs
+
+
+def _tokens_carry_hijack_assignment(tokens: list) -> bool:
+    """True when any token is a tracked-var assignment (WORD-carried, tirith's trigger shape)."""
+    return any((m := _is_env_assignment_token(t)) is not None and m[0] in _ENV_HIJACK_VARS
+               for t in tokens)
+
+
+
+def _env_override_hijack_findings(command: str):
+    """Yield tirith-parity findings from the pattern layer.
+
+    Mirrors tirith 0.3.3 ``interpreter_hijack_env`` semantics (verified against the binary,
+    2026-09-15): flags PYTHONPATH assignments carried as WORDS of an export/env command — that
+    includes an assignment run before the word (``FOO=1 env PYTHONPATH=v cmd``, which tirith
+    blocks). NOT flagged, matching tirith's allow verdicts: bare prefix assignments
+    (``PYTHONPATH=v cmd``, covered by the value-tracking layer once a value was denied) and the
+    spaced form (``export PYTHONPATH = v`` — not a POSIX assignment, so flagging it is a false
+    positive).
+    """
+    for segment in _iter_top_level_shell_segments(command):
+        first = next(_iter_shell_command_word_spans(segment), None)
+        if first is None:
+            continue
+        tokens = _shell_segment_tokens(segment, first[0])
+        if not tokens or not tokens[0]:
+            continue
+        i = 0
+        while i < len(tokens) and _is_env_assignment_token(tokens[i]) is not None:
+            i += 1
+        if i >= len(tokens):
+            continue
+        name0 = os.path.basename(_deobfuscate_shell_word_for_detection(tokens[i])).lower()
+        if name0 in ("export", "env") and _tokens_carry_hijack_assignment(tokens[i + 1:]):
+            yield (ENV_OVERRIDE_HIJACK_DESCRIPTION, "PYTHONPATH")
+
+
+def extract_env_override_assignments(command: str) -> list:
+    """Tracked PYTHONPATH assignments carried by *command* in any plain spelling, for
+    value-tracking: prefix assignments (``PYTHONPATH=v cmd``), ``export``/``env`` word forms,
+    and an assignment run before the word (``FOO=1 env PYTHONPATH=v cmd``). The spaced
+    ``NAME = value`` form is NOT extracted (not a POSIX assignment). Obfuscated spellings are
+    by-design non-coverage."""
+    pairs = []
+    for segment in _iter_top_level_shell_segments(command):
+        # Tokenize from index 0: the executable-name span iterator SKIPS leading assignment
+        # words by design (they are not executables), and those are exactly what this
+        # extractor must see.
+        tokens = _shell_segment_tokens(segment, 0)
+        if not tokens:
+            continue
+        i = 0
+        while i < len(tokens):
+            m = _is_env_assignment_token(tokens[i])
+            if m is None:
+                break
+            if m[0] in _ENV_HIJACK_VARS:
+                pairs.append(m)
+            i += 1
+        if i < len(tokens) and os.path.basename(_deobfuscate_shell_word_for_detection(tokens[i])).lower() in ("export", "env"):
+            pairs.extend(_assignment_pairs_from_tokens(tokens[i + 1:]))
+    return pairs
+
+
+def script_files_executed_by_command(command: str, cwd: str | None = None) -> list:
+    """Best-effort absolute paths of LOCAL script files a command plainly executes.
+
+    Bounded heuristic for the guard's value-tracking layer: ``bash script.sh``, ``sh -eu
+    script.sh``, ``./script.sh``, absolute script paths. Inline-code flags (``-c``…) never
+    produce a file. A relative path resolves against *cwd* or the process cwd; missing/unreadable
+    files are simply absent (the callers must never block on that).
+    """
+    out = []
+    for segment in _iter_top_level_shell_segments(command):
+        first = next(_iter_shell_command_word_spans(segment), None)
+        if first is None:
+            continue
+        tokens = _shell_segment_tokens(segment, first[0])
+        if not tokens or not tokens[0]:
+            continue
+        name0 = os.path.basename(_deobfuscate_shell_word_for_detection(tokens[0])).lower()
+        candidate = None
+        if name0 in _SHELL_SCRIPT_EXECUTABLES:
+            inline_code = False
+            for token in tokens[1:]:
+                if token in _SHELL_INLINE_CODE_FLAGS:
+                    inline_code = True
+                    break
+                if token == "--":
+                    break
+                if token.startswith("-"):
+                    continue
+                candidate = token
+                break
+            if inline_code:
+                continue
+        elif ((tokens[0].startswith(("./", "../", "/")) or tokens[0].endswith(".sh"))
+                and not tokens[0].startswith("-")):
+            candidate = tokens[0]
+        if not candidate:
+            continue
+        path = os.path.expanduser(candidate)
+        if not os.path.isabs(path):
+            try:
+                base = os.path.expanduser(cwd) if cwd else os.getcwd()
+            except Exception:
+                base = os.getcwd()
+            path = os.path.join(base, path)
+        try:
+            if os.path.isfile(path) and os.path.getsize(path) <= _SCRIPT_SCAN_MAX_BYTES:
+                out.append(os.path.abspath(path))
+        except OSError:
+            continue
+    return out
+
+
+def extract_env_override_assignments_from_file(path: str) -> list:
+    """Tracked PYTHONPATH assignments in a script's shell lines (structurally positioned):
+    leading assignment statements, ``export``/``env`` word forms, spaced ``=`` form. Reads are
+    bounded; any I/O or parse error yields an empty result (never a block by itself)."""
+    pairs = []
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            lines = [f.readline() for _ in range(_SCRIPT_SCAN_MAX_LINES)]
+    except OSError:
+        return pairs
+    for line in lines:
+        if not line or not line.strip():
+            continue
+        try:
+            lexer = shlex.shlex(line, posix=True, punctuation_chars="<>")
+            lexer.whitespace_split, lexer.commenters = True, "#"
+            tokens = list(lexer)
+        except ValueError:
+            continue
+        if not tokens:
+            continue
+        if os.path.basename(tokens[0]).lower() in ("export", "env"):
+            pairs.extend(_assignment_pairs_from_tokens(tokens[1:]))
+            continue
+        for token in tokens:
+            m = _is_env_assignment_token(token)
+            if m is None:
+                break
+            if m[0] in _ENV_HIJACK_VARS:
+                pairs.append(m)
+    return pairs
+
+
 def _skip_shell_whitespace(command: str, pos: int) -> int:
     while pos < len(command) and command[pos].isspace():
         pos += 1
@@ -1534,6 +1724,8 @@ def detect_dangerous_command(command: str) -> tuple:
                 return (True, description, description)
     normalized = _normalize_command_for_detection(command)
     for description, _ in _execution_flag_findings(normalized):
+        return (True, description, description)
+    for description, _ in _env_override_hijack_findings(command):
         return (True, description, description)
     if _is_shell_token_spliced_gateway_lifecycle(command):
         return (True, _GATEWAY_LIFECYCLE_SPLICE_DESCRIPTION, _GATEWAY_LIFECYCLE_SPLICE_DESCRIPTION)

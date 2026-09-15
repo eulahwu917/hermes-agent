@@ -1,8 +1,12 @@
 """Tirith pre-exec security scanning wrapper: runs the tirith binary as a subprocess to scan
 commands for content-level threats (homograph URLs, pipe-to-interpreter, terminal injection).
 The exit code is the verdict source of truth (0 allow, 1 block, 2 warn); JSON stdout only
-enriches findings. Operational failures (spawn error, timeout, unknown exit) respect
-``fail_open``; programming errors propagate. Auto-install: a missing tirith is downloaded from
+enriches findings. Operational failures and any form of scanner unavailability (spawn error, timeout,
+unknown exit, circuit breaker, no platform build) follow ``security.tirith_fail_open``,
+which DEFAULTS TO FAIL-CLOSED: the command is blocked with a clear reason instead of
+silently proceeding with pattern matching only. Setting ``tirith_fail_open: true`` is the
+operator's explicit, recorded (config.yaml) acknowledgement of degraded operation.
+Programming errors propagate. Auto-install: a missing tirith is downloaded from
 GitHub releases to $HERMES_HOME/bin/tirith in a background thread -- SHA-256 always verified,
 cosign provenance when cosign is on PATH."""
 
@@ -53,7 +57,7 @@ def _load_security_config() -> dict:
         "tirith_enabled": _env_bool("TIRITH_ENABLED", cfg.get("tirith_enabled", True)),
         "tirith_path": os.getenv("TIRITH_BIN", cfg.get("tirith_path", "tirith")),
         "tirith_timeout": _env_int("TIRITH_TIMEOUT", cfg.get("tirith_timeout", 5)),
-        "tirith_fail_open": _env_bool("TIRITH_FAIL_OPEN", cfg.get("tirith_fail_open", True))}
+        "tirith_fail_open": _env_bool("TIRITH_FAIL_OPEN", cfg.get("tirith_fail_open", False))}
 
 
 # --- Module state ---
@@ -426,7 +430,8 @@ def _resolve_tirith_path(configured_path: str) -> str:
     found, may_install = _resolve_locally(configured_path, warn_missing=True)
     if found or not may_install:
         return found or expanded
-    # A background install is running: don't start a parallel one; fail-open until it finishes.
+    # A background install is running: don't start a parallel one; the spawn path stays unresolved
+    # until it finishes, and the fail-open/fail-closed policy then applies as usual.
     if _install_running() or _disk_marker_blocks_install():
         return expanded
     installed = _record_install_result(*_install_tirith())
@@ -469,7 +474,7 @@ def ensure_installed(*, log_failures: bool = True):
         _install_thread = threading.Thread(target=_background_install, daemon=True,
                                            kwargs={"log_failures": log_failures})
         _install_thread.start()
-    return None  # not available yet; commands fail-open until ready
+    return None  # not available yet; the fail-open/fail-closed policy (default: closed) applies
 
 
 # --- Main API ---
@@ -509,32 +514,44 @@ def _crash(fail_open: bool, open_summary: str, closed_summary: str) -> dict:
     return _fail(fail_open, open_summary, closed_summary)
 
 
+# Remediation tail for fail-closed blocks: the fix direction plus the recorded-acknowledgement
+# escape hatch (security.tirith_fail_open: true). Kept OUT of the verdict when failing open.
+_ACK_HINT = ("Restore the scanner (tirith auto-installs to $HERMES_HOME/bin/tirith), set "
+             "security.tirith_enabled: false to disable scanning, or explicitly acknowledge "
+             "degraded (pattern-matching-only) operation with security.tirith_fail_open: true in config.yaml.")
+
+
 def check_command_security(command: str) -> dict:
     """Run the tirith scan on a command -> ``{"action": allow|warn|block, "findings", "summary"}``.
-    Exit code determines the action; JSON enriches. Spawn failures/timeouts respect fail_open."""
-    global _crash_count, _circuit_open, _circuit_open_at
+    Exit code determines the action; JSON enriches. Every form of scanner unavailability honours
+    ``security.tirith_fail_open`` — fail-CLOSED by default (no silent degradation to pattern matching).
+    """
+    global _crash_count
+
     cfg = _load_security_config()
+    fail_open = bool(cfg.get("tirith_fail_open", False))  # absent key == the fail-closed default
     if not cfg["tirith_enabled"]:
         return _verdict("allow")
-    # Circuit breaker: if tirith has crashed _CRASH_LIMIT times in a row, stop trying and fail open (issue
-    # #41400). After _CIRCUIT_RETRY_S the breaker half-opens: exactly one caller claims the probe slot —
-    # claiming re-arms _circuit_open_at under _breaker_lock, so concurrent callers see a fresh TTL and stay
-    # fail-open — and falls through to a real scan below.
+    # Circuit breaker: if tirith has crashed _CRASH_LIMIT times in a row, stop trying for the rest of the
+    # process. Without this, a corrupted or missing binary causes every tool call to hit the same spawn
+    # failure → agent retry loop, hanging the user for 20+ minutes (issue #41400). Fail-closed default:
+    # the open breaker now BLOCKS instead of silently allowing un-scanned commands.
     if _circuit_open:
-        with _breaker_lock:
-            if _circuit_open and time.monotonic() - _circuit_open_at < _CIRCUIT_RETRY_S:
-                return _verdict("allow", "tirith disabled (circuit breaker)")
-            if _circuit_open:  # TTL expired: claim the single-flight probe slot for this window
-                _circuit_open_at = time.monotonic()
-                logger.info("tirith circuit breaker half-open: probing after %ds", _CIRCUIT_RETRY_S)
+        return _fail(fail_open, "tirith disabled (circuit breaker)",
+                     "tirith unavailable: circuit breaker opened after repeated scanner failures. "
+                     + _ACK_HINT)
+
     # No binary for this platform, ever: skip the resolver so we never spawn.
     if not is_platform_supported():
-        return _verdict("allow")
+        return _fail(fail_open, "tirith has no build for this platform",
+                     "tirith is not available for this platform, so the command cannot be scanned. "
+                     + _ACK_HINT)
     tirith_path = _resolve_tirith_path(cfg["tirith_path"])
-    timeout, fail_open = cfg["tirith_timeout"], cfg["tirith_fail_open"]
+    timeout = cfg["tirith_timeout"]
     if tirith_path is None:
         _warn_once("tirith_path_none", "tirith path resolved to None; scanning disabled")
-        return _fail(fail_open, "tirith path unavailable", "tirith path unavailable (fail-closed)")
+        return _fail(fail_open, "tirith path unavailable",
+                     "tirith path unavailable (fail-closed). " + _ACK_HINT)
     try:
         result = subprocess.run(
             [tirith_path, "check", "--json", "--non-interactive", "--shell", "posix", "--", command],
@@ -545,23 +562,19 @@ def check_command_security(command: str) -> dict:
         # so each failure mode surfaces once, not per command.
         _warn_once(f"tirith_spawn_failed:{type(exc).__name__}:{getattr(exc, 'errno', '')}",
                    "tirith spawn failed: %s", exc)
-        return _crash(fail_open, f"tirith unavailable: {exc}", f"tirith spawn failed (fail-closed): {exc}")
+        return _crash(fail_open, f"tirith unavailable: {exc}", f"tirith spawn failed (fail-closed): {exc}. " + _ACK_HINT)
     except subprocess.TimeoutExpired:
         _warn_once(f"tirith_timeout:{timeout}", "tirith timed out after %ds", timeout)
-        return _crash(fail_open, f"tirith timed out ({timeout}s)", "tirith timed out (fail-closed)")
+        return _crash(fail_open, f"tirith timed out ({timeout}s)", f"tirith timed out after {timeout}s (fail-closed). " + _ACK_HINT)
     exit_code = result.returncode
     if (action := _EXIT_ACTIONS.get(exit_code)) is None:
         # Unknown exit code (includes signal-killed, e.g. -11): respect fail_open.
         logger.warning("tirith returned unexpected exit code %d", exit_code)
         return _crash(fail_open, f"tirith exit code {exit_code} (fail-open)",
-                      f"tirith exit code {exit_code} (fail-closed)")
-    # Any completed scan (allow/block/warn) proves the binary is healthy: clear the streak and close the
-    # breaker. This is the half-open probe's recovery path, and it also fixes the streak never resetting on
-    # block/warn verdicts.
-    _crash_count = 0
-    if _circuit_open:
-        _circuit_open, _circuit_open_at = False, 0.0
-        logger.info("tirith circuit breaker closed after successful probe")
+                      f"tirith exit code {exit_code} (fail-closed). " + _ACK_HINT)
+    if action == "allow":
+        _crash_count = 0  # successful execution resets the circuit breaker
+
     # JSON enriches findings/summary; a parse failure never changes the verdict.
     findings, summary = [], ""
     try:

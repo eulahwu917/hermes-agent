@@ -2623,10 +2623,20 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin, 
                 ensure_installed(log_failures=False) is None and is_platform_supported()
                 and (self.config.get("security", {}) or {}).get("tirith_enabled", True)
             ):
-                _cprint(
-                    f"  {_DIM}⚠ tirith security scanner enabled but not available "
-                    f"— command scanning will use pattern matching only{_RST}"
-                )
+                from tools.tirith_security import _load_security_config
+                _fail_open = _load_security_config().get("tirith_fail_open", False)
+                if _fail_open:
+                    _cprint(
+                        f"  {_DIM}⚠ tirith security scanner enabled but not available — "
+                        f"pattern matching only (acknowledged via security.tirith_fail_open: true){_RST}"
+                    )
+                else:
+                    _cprint(
+                        f"  {_DIM}⚠ tirith security scanner enabled but not available — terminal "
+                        f"commands will be BLOCKED (fail-closed). Restore tirith, set "
+                        f"security.tirith_enabled: false, or acknowledge degraded mode with "
+                        f"security.tirith_fail_open: true.{_RST}"
+                    )
         except Exception:
             pass
 

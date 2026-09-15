@@ -14,9 +14,11 @@ call time; sibling-defined names are imported from their defining module.
 from dataclasses import dataclass
 import hashlib
 import importlib
+import json
 import logging
 import os
 import threading
+import time
 from typing import Optional
 
 from utils import env_var_enabled, is_truthy_value
@@ -28,7 +30,8 @@ from tools.approval_context import (
     _tirith_fail_open, get_current_session_key,
 )
 from tools.approval_detection import (
-    _approval_key_aliases, _check_sudo_stdin_guard, detect_dangerous_command, detect_hardline_command,
+    ENV_OVERRIDE_HIJACK_DESCRIPTION, _approval_key_aliases, _check_sudo_stdin_guard,
+    detect_dangerous_command, detect_hardline_command,
 )
 from tools.approval_floors import (
     _command_matches_permanent_allowlist, _hardline_block_result, _match_user_deny_rule, _sudo_stdin_block_result,
@@ -109,6 +112,117 @@ def _denial_breaker_addendum(session_key: str) -> str:
         "the security reviewer. STOP attempting variations of this "
         "operation. Report the blocked operation to the user and either ask them to run it manually or use /approve."
     )
+
+
+# --- Denied environment-override tracking (R2: follow the VALUE) + re-route events (R3) -----------------------
+# A denied interpreter-hijack override (tirith ``interpreter_hijack_env`` or the pattern layer's parity rule) is
+# remembered by (variable, VALUE), not by spelling, so the same value carried by an executed script or any plain
+# re-spelling is recognized. Events are both a logger line and an append-only JSONL ledger under
+# $HERMES_HOME/security/guard_events.jsonl — reviewable without diffing transcripts.
+_DENIED_OVERRIDE_TTL_S = 1800  # "shortly after in the same session" window
+_DENIED_OVERRIDE_MAX_PER_SESSION = 16
+_DENIED_OVERRIDE_MAX_SESSIONS = 256
+_denied_env_overrides: dict[str, dict[tuple[str, str], float]] = {}
+_GUARD_EVENT_LEDGER_MAX_BYTES = 4 * 1024 * 1024
+ENV_OVERRIDE_CARRYOVER_KEY = "previously denied environment override reappearing (value-tracked)"
+
+
+def _record_guard_event(kind: str, session_key: str, *, var: str, value: str, outcome: str,
+                        command: str = "", source: str = "") -> None:
+    """Surface a denial-tracking event. The ledger write must NEVER affect a guard verdict."""
+    logger.warning(
+        "[guard-denial-event] kind=%s session=%s %s=%r outcome=%s%s command=%r",
+        kind, session_key, var, value[:300], outcome,
+        (f" source={source}" if source else ""), command[:900],
+    )
+    try:
+        from hermes_constants import get_hermes_home
+        log_dir = os.path.join(str(get_hermes_home()), "security")
+        os.makedirs(log_dir, exist_ok=True)
+        ledger_path = os.path.join(log_dir, "guard_events.jsonl")
+        if os.path.isfile(ledger_path) and os.path.getsize(ledger_path) > _GUARD_EVENT_LEDGER_MAX_BYTES:
+            os.rename(ledger_path, ledger_path + ".prev")
+        with open(ledger_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({
+                "ts": time.time(), "kind": kind, "session": session_key, "var": var,
+                "value": value[:500], "outcome": outcome, "source": source[:500],
+                "command": command[:1000],
+            }) + "\n")
+    except Exception as exc:  # never alter a guard verdict
+        logger.debug("guard event ledger write failed: %s", exc)
+
+
+def _remember_denied_env_override(command: str) -> None:
+    """Persist the env-override (variable, value) pairs carried by a DENIED command and emit the
+    denial event row, so the same VALUE reappearing later in the session is recognized."""
+    from tools.approval_detection import extract_env_override_assignments
+    entries = extract_env_override_assignments(command)
+    if not entries:
+        return
+    session_key = get_current_session_key()
+    now = time.time()
+    with _lock:
+        bucket = _denied_env_overrides.setdefault(session_key, {})
+        for var, value in entries:
+            bucket[(var, value)] = now
+        while len(bucket) > _DENIED_OVERRIDE_MAX_PER_SESSION:
+            oldest = min(bucket, key=bucket.get)
+            bucket.pop(oldest, None)
+        while len(_denied_env_overrides) > _DENIED_OVERRIDE_MAX_SESSIONS:
+            _denied_env_overrides.pop(next(iter(_denied_env_overrides)), None)
+    for var, value in entries:
+        _record_guard_event("denied", session_key, var=var, value=value,
+                            outcome="blocked", command=command)
+
+
+def _recently_denied_env_overrides(session_key: str) -> list[tuple[str, str]]:
+    """(variable, value) pairs denied within the TTL window for this session."""
+    if not session_key:
+        return []
+    now = time.time()
+    with _lock:
+        bucket = _denied_env_overrides.get(session_key)
+        if not bucket:
+            return []
+        fresh = {pair: ts for pair, ts in bucket.items() if now - ts <= _DENIED_OVERRIDE_TTL_S}
+        _denied_env_overrides[session_key] = fresh
+        return list(fresh)
+
+
+def _reappearing_denied_overrides(command: str, cwd: str | None = None) -> list[tuple[str, str, str]]:
+    """(variable, value, source) entries where a previously DENIED override value re-appears in
+    *command* or in the content of a script file it plainly executes. Source is "command" or
+    the absolute script path. Token-splicing obfuscation is by-design non-coverage."""
+    from tools.approval_detection import (
+        extract_env_override_assignments,
+        extract_env_override_assignments_from_file,
+        script_files_executed_by_command,
+    )
+    denied = set(_recently_denied_env_overrides(get_current_session_key()))
+    if not denied:
+        return []
+    out = []
+    seen = set()
+    for var, value in extract_env_override_assignments(command):
+        if (var, value) in denied and (var, value) not in seen:
+            seen.add((var, value))
+            out.append((var, value, "command"))
+    for path in script_files_executed_by_command(command, cwd):
+        for var, value in extract_env_override_assignments_from_file(path):
+            if (var, value) in denied and (var, value) not in seen:
+                seen.add((var, value))
+                out.append((var, value, path))
+    return out
+
+
+def _approved_with_carryover_watch(command: str, command_cwd: str | None = None) -> dict:
+    """Approved fast-path (yolo / mode=off / allowlist / approve-context / isolated container):
+    still emit a carryover event when a denied override reappears, so a re-routed denial is
+    VISIBLE without re-blocking these explicitly-trusted paths."""
+    for var, value, source in _reappearing_denied_overrides(command, command_cwd):
+        _record_guard_event("carryover", get_current_session_key(), var=var, value=value,
+                            outcome="admitted", command=command, source=source)
+    return _approved()
 
 # --- Gateway approval queue (the blocking wait loop lives in approval_gateway_wait) ---------------------------------
 
@@ -634,13 +748,14 @@ def _unattended_contexts() -> list[_Unattended]:
     return contexts
 
 
-def _unattended_deny(command: str, ctx: _Unattended) -> dict | None:
+def _unattended_deny(command: str, ctx: _Unattended, command_cwd: str | None = None) -> dict | None:
     """Deny-mode handling for one unattended context (cron / -q / webhook); None = allow.
 
     Pattern detection first, then tirith so content-level threats (homograph URLs,
     pipe-to-interpreter, terminal injection) are caught even when the pattern detector misses.
     An un-importable tirith honours ``security.tirith_fail_open``: fail-closed means block,
-    since nobody can approve.
+    since nobody can approve. Last, R2 value-tracking: a denied interpreter-hijack override
+    re-appearing in the command or in an executed script's content is detected.
     """
     if ctx.mode() != "deny":
         return None
@@ -650,11 +765,14 @@ def _unattended_deny(command: str, ctx: _Unattended) -> dict | None:
             subject, noun="dangerous commands",
             advice="Find an alternative approach that avoids this command.")}
 
-    is_dangerous, pattern_key, description = detect_dangerous_command(command)
-    if is_dangerous and not _is_permanently_approved(pattern_key):
+    is_dangerous, _pk, description = detect_dangerous_command(command)
+    if is_dangerous and not _is_permanently_approved(_pk):
         result = block(f"Command flagged as dangerous ({description})")
         if ctx.name == "single_query":
-            result.update(pattern_key=pattern_key, description=description)
+            result.update(pattern_key=_pk, description=description)
+        # Record any tracked override carried by a DENIED command regardless of which
+        # rule produced the block (the extractor is a no-op when the command has none).
+        _remember_denied_env_override(command)
         return result
     try:
         from tools.tirith_security import check_command_security
@@ -667,7 +785,20 @@ def _unattended_deny(command: str, ctx: _Unattended) -> dict | None:
             f"so this command cannot be silently allowed — and {ctx.clause}. "
             f"Find an alternative approach, install tirith, or set approvals.{ctx.cfg_key}: approve in config.yaml.")}
     if tirith.get("action") in ("block", "warn"):
+        _remember_denied_env_override(command)  # no-op unless the command carries a tracked override
         return block(_format_tirith_description(tirith))
+    # R2/R3: a denied env override re-appearing here (command text or executed-script content)
+    # is DETECTED, not merely logged. Plain spellings only; token-splicing is declared non-coverage.
+    recurring = _reappearing_denied_overrides(command, command_cwd)
+    if recurring:
+        var, value, source = recurring[0]
+        _record_guard_event("carryover", get_current_session_key(), var=var, value=value,
+                            outcome="blocked", command=command, source=source)
+        carried = (f", carried by executed script {source}" if source != "command" else "")
+        return block(
+            f"command carries an environment override denied earlier in this session: "
+            f"{var}={value!r}{carried}"
+        )
     return None
 
 
@@ -1158,13 +1289,18 @@ def _tirith_scan(command: str) -> dict:
 
 def check_all_command_guards(command: str, env_type: str,
                              approval_callback=None,
-                             has_host_access: bool = False) -> dict:
+                             has_host_access: bool = False,
+                             command_cwd: str | None = None) -> dict:
     """Run all pre-exec security checks and return a single approval decision. Tirith and
     dangerous-command findings are presented as ONE combined approval request, so a gateway
     force=True replay cannot bypass one check when only the other was shown to the user.
-    ``has_host_access``: a Docker sandbox with bind-mounted host paths takes the normal flow."""
+    ``has_host_access``: a Docker sandbox with bind-mounted host paths takes the normal flow.
+    ``command_cwd``: the session cwd the command runs in, so R2 script-content tracking can
+    resolve relative script paths (best-effort; opaque paths simply are not scanned)."""
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
-        return _user_deny_block(command) or _approved()
+        if (blocked := _user_deny_block(command)) is not None:
+            return blocked
+        return _approved_with_carryover_watch(command, command_cwd)
 
     blocked = _floor_block(command, sudo_guard=True)
     if blocked is not None:
@@ -1177,19 +1313,19 @@ def check_all_command_guards(command: str, env_type: str,
 
     approval_mode = approval_context._get_approval_mode()
     if _yolo_active() or approval_mode == "off":
-        return _approved()
+        return _approved_with_carryover_watch(command, command_cwd)
     if _command_matches_permanent_allowlist(command):
-        return _approved()
+        return _approved_with_carryover_watch(command, command_cwd)
 
     approval_callback, is_cli, is_gateway, is_ask = _presence(approval_callback)
     # Outside CLI/gateway/ask flows we never block on approvals: each
     # unattended context applies its configured deny/approve mode, else allow.
     if not is_cli and not is_gateway and not is_ask:
         for ctx in _unattended_contexts():
-            result = _unattended_deny(command, ctx)
+            result = _unattended_deny(command, ctx, command_cwd)
             if result is not None:
                 return result
-        return _approved()
+        return _approved_with_carryover_watch(command, command_cwd)
 
     # Gather findings: warnings = [(pattern_key, description, is_tirith)]. Tirith block AND warn both go through the
     # approval flow (block used to be a hard stop) so users can inspect the findings and approve.
@@ -1205,6 +1341,16 @@ def check_all_command_guards(command: str, env_type: str,
             warnings.append((tirith_key, _format_tirith_description(tirith_result), True))
     if is_dangerous and not is_approved(session_key, pattern_key):
         warnings.append((pattern_key, description, False))
+    # R2/R3: a denied env override re-appearing here (command text or executed-script content)
+    # goes through the normal approval flow as a value-tracked finding.
+    recurring = _reappearing_denied_overrides(command, command_cwd)
+    if recurring:
+        var, value, source = recurring[0]
+        warnings.append((ENV_OVERRIDE_CARRYOVER_KEY,
+                         (f"environment override denied earlier in this session reappears: "
+                          f"{var}={value!r}"
+                          + (f" (in executed script {source})" if source != "command" else "")),
+                         False))
     if not warnings:
         return _approved()
 
@@ -1215,13 +1361,23 @@ def check_all_command_guards(command: str, env_type: str,
     # "Always" is offered when at least one warning is a dangerous-pattern key the persistence layer would actually
     # allowlist permanently. Pure-tirith findings are session-max by design, so a tirith-only prompt hides Always;
     # mixed prompts offer it (the pattern key persists, tirith downgrades to session — see _persist_choice).
-    return _human_decision(
+    result = _human_decision(
         _COMMAND_GATE, command=command, description=combined_desc,
         pattern_key=primary_key, pattern_keys=all_keys, warnings=warnings,
         session_key=session_key, approval_callback=approval_callback,
         is_cli=is_cli, is_gateway=is_gateway, is_ask=is_ask, smart=approval_mode == "smart",
         permanent_capable=any(not is_t for _, _, is_t in warnings),
     )
+    if not result.get("approved"):
+        # A denial does not need the env rule to be the blocking one: the VALUE carried
+        # by the denied command is what gets tracked (extraction no-ops without a value).
+        _remember_denied_env_override(command)
+        return result
+    if recurring:
+        var, value, source = recurring[0]
+        _record_guard_event("carryover", session_key, var=var, value=value,
+                            outcome="admitted", command=command, source=source)
+    return result
 
 
 _EXECUTE_CODE_DESCRIPTION = (
