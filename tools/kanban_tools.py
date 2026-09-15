@@ -895,7 +895,25 @@ def _handle_create(args: dict, **kw) -> str:
             initial_status=str(args.get("initial_status") or "running"),
             created_by=os.environ.get("HERMES_PROFILE") or "worker", session_id=session_id)
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
-        return _ok(task_id=new_tid, **landed, subscribed=_maybe_auto_subscribe(conn, new_tid))
+        # Fail-fast visibility for the orchestrator: a typo'd/invented
+        # assignee would otherwise produce a card that sits in ready forever
+        # with no diagnostic anywhere. The warning rides on the tool result so
+        # the calling agent sees it in-session, exactly when the typo happens.
+        try:
+            _unresolved = kb.assignee_resolves_to_profile(str(assignee))
+        except Exception:
+            _unresolved = None
+        _warnings = None
+        if _unresolved is False:
+            _warnings = [(
+                f"assignee {assignee!r} does not resolve to a profile on disk — "
+                f"the dispatcher will NEVER spawn this card. Fix the name "
+                f"(typo? `hermes kanban assignees` lists on-disk profiles; "
+                f"`hermes -p <name> setup` creates one) or confirm it is a "
+                f"deliberate external lane pulled via `hermes kanban claim`."
+            )]
+        return _ok(task_id=new_tid, **landed, warnings=_warnings,
+                   subscribed=_maybe_auto_subscribe(conn, new_tid))
 
 
 def _resolve_notify_target() -> Optional[dict[str, Any]]:

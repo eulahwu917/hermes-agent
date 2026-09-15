@@ -106,6 +106,11 @@ class DispatchResult:
     Code terminal like ``orion-cc``), not a Hermes profile. Expected steady-state
     on multi-lane setups, NOT operator-actionable; tracked apart so health
     telemetry can tell "stuck" from "correctly idle"."""
+    assignee_unresolved: list[tuple[str, str]] = field(default_factory=list)
+    """``(task_id, assignee)`` pairs whose assignee resolves to NO profile on
+    disk — they will never spawn. Also surfaced as a per-task
+    ``assignee_unresolved`` event and a dispatcher warning line, so a typo'd
+    assignee is loud instead of silent-forever."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """``(task_id, assignee, current_running_count)`` deferred because the
     assignee is at ``kanban.max_in_progress_per_profile``. Picked up on a later
@@ -1514,6 +1519,31 @@ def _dispatch_lane_task(
     profile_exists = _profile_exists_fn()
     if profile_exists is not None and not profile_exists(assignee):
         result.skipped_nonspawnable.append(task_id)
+        result.assignee_unresolved.append((task_id, assignee))
+        # Surface, don't silently skip: a typo'd/invented assignee is
+        # invisible forever otherwise. Deduped against the card's existing
+        # events so a parked external lane doesn't spam one event per tick.
+        latest = _kb._latest_event(conn, task_id, "assignee_unresolved")
+        _payload = _kb._json_dict(_kb._row_get(latest, "payload")) if latest else {}
+        _already_flagged = (
+            _payload.get("assignee") == assignee
+            and _payload.get("stage") == "dispatch"
+        )
+        if not _already_flagged:
+            if not dry_run:
+                with _kb.write_txn(conn):
+                    _kb._append_event(
+                        conn, task_id, "assignee_unresolved",
+                        {"assignee": assignee, "stage": "dispatch"},
+                    )
+            _kb._log.warning(
+                "kanban dispatch: task %s: assignee %r does not resolve to a "
+                "profile on disk — the card will NEVER spawn. Fix with "
+                "`hermes kanban assign %s <profile>` (or `hermes kanban "
+                "reassign %s <profile>`); `hermes kanban assignees` lists the "
+                "on-disk profiles.",
+                task_id, assignee, task_id, task_id,
+            )
         return False
     # Per-profile cap: one profile's local model / API quota / browser pool
     # must not be overwhelmed by a fan-out even with global headroom.

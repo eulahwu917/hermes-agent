@@ -41,6 +41,24 @@ def _none_profile(value: str) -> Optional[str]:
     return None if value.lower() in {"none", "-", "null"} else value
 
 
+def _warn_unresolved_assignee(assignee: str, verb: str) -> None:
+    """Loud, immediate warning when an assignee resolves to no profile on
+    disk (the dispatcher's own primitive): such a card sits in ready forever
+    with no worker ever spawned for it. Deliberate external lanes (a terminal
+    pulling via ``claim_task``) see the same warning — the note tells them
+    why that case is fine."""
+    print(
+        f"⚠ kanban {verb}: assignee {assignee!r} does not resolve to a profile "
+        f"on disk — this card will NEVER be dispatched.\n"
+        f"   If {assignee!r} is a typo, fix it now: `hermes kanban assignees` "
+        f"lists the on-disk profiles and `hermes -p <name> setup` creates a "
+        f"missing one.\n"
+        f"   If it is a deliberate external lane (a terminal claims it via "
+        f"`hermes kanban claim`), you can ignore this.",
+        file=sys.stderr,
+    )
+
+
 def _parse_metadata_flag(raw: Optional[str]) -> tuple[Optional[dict], int]:
     """Parse ``--metadata`` JSON; returns ``(dict|None, rc)`` with rc=2 on error."""
     if not raw:
@@ -378,6 +396,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
                              if is_dispatcher_owned_worker_context() else None),
         )
         task = kb.get_task(conn, task_id)
+    if task.assignee and kb.assignee_resolves_to_profile(task.assignee) is False:
+        _warn_unresolved_assignee(task.assignee, "create")
     if getattr(args, "json", False):
         _print_json(_task_to_dict(task))
     else:
@@ -573,6 +593,8 @@ def _cmd_assign(args: argparse.Namespace) -> int:
     profile = _none_profile(args.profile)
     with kbc.connect_closing() as conn:
         ok = kb.assign_task(conn, args.task_id, profile)
+    if ok and profile and kb.assignee_resolves_to_profile(profile) is False:
+        _warn_unresolved_assignee(profile, "assign")
     return _ok_or_err(ok, f"no such task: {args.task_id}",
                       f"Assigned {args.task_id} to {profile or '(unassigned)'}")
 
@@ -609,6 +631,8 @@ def _cmd_reassign(args: argparse.Namespace) -> int:
     reclaim = bool(getattr(args, "reclaim", False))
     with kbc.connect_closing() as conn:
         ok = kb.reassign_task(conn, args.task_id, profile, reclaim_first=reclaim, reason=getattr(args, "reason", None))
+    if ok and profile and kb.assignee_resolves_to_profile(profile) is False:
+        _warn_unresolved_assignee(profile, "reassign")
     return _ok_or_err(
         ok,
         f"cannot reassign {args.task_id} (unknown id, or still running — pass --reclaim to release first)",

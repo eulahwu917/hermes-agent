@@ -136,6 +136,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
+    if res.assignee_unresolved:
+        for tid, who in res.assignee_unresolved:
+            print(
+                f"!! Skipped (assignee {who!r} has NO profile on disk — will NEVER dispatch): {tid}"
+            )
     return 0
 
 

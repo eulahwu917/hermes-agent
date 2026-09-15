@@ -220,7 +220,7 @@ _TICK_ACTIVITY_FIELDS = (
     "spawned", "reclaimed", "promoted", "reconciled_orphans", "crashed", "stale",
     "timed_out", "auto_blocked", "rate_limited", "auto_assigned_default",
     "respawn_guarded", "skipped_per_profile_capped", "skipped_unassigned",
-    "skipped_nonspawnable",
+    "skipped_nonspawnable", "assignee_unresolved",
 )
 
 
@@ -1366,6 +1366,17 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
+                # Fail-fast visibility: an assignee that resolves to no profile
+                # on disk would otherwise sit in ready/todo forever with zero
+                # diagnostic anywhere (the 2026-09-14 silent-forever incident).
+                # Record it on the card at creation; the CLI/tool surfaces
+                # warn, dispatch re-surfaces, and the weekly Tier-1 health
+                # check enumerates the orphans.
+                if assignee and assignee_resolves_to_profile(assignee) is False:
+                    _append_event(
+                        conn, task_id, "assignee_unresolved",
+                        {"assignee": assignee, "stage": "created"},
+                    )
                 if task_status == "blocked":
                     _append_event(
                         conn,
@@ -1527,6 +1538,10 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
         else:
             conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (profile, task_id))
         _append_event(conn, task_id, "assigned", {"assignee": profile})
+        # Same fail-fast recording as create_task: a name no dispatcher can
+        # resolve must never be silently applied.
+        if profile and assignee_resolves_to_profile(profile) is False:
+            _append_event(conn, task_id, "assignee_unresolved", {"assignee": profile, "stage": "assigned"})
     # Observer fires AFTER commit so subscribers see durable state.
     notify_task_updated(conn, task_id, ("assignee",))
     return True
@@ -4080,6 +4095,29 @@ def known_assignees(conn: sqlite3.Connection) -> list[dict]:
         {"name": name, "on_disk": name in on_disk, "counts": counts.get(name, {})}
         for name in sorted(on_disk | set(counts))
     ]
+
+
+def assignee_resolves_to_profile(assignee: Optional[str]) -> Optional[bool]:
+    """Whether ``assignee`` names a live profile on disk.
+
+    Uses the dispatcher's own resolution primitive
+    (``hermes_cli.profiles.profile_exists``) so creation-time validation can
+    never disagree with dispatch-time spawning. Returns ``None`` when the
+    profiles module cannot be imported (callers warn and proceed — the
+    dispatcher fails open the same way), ``False`` for a name no worker will
+    ever spawn for.
+    """
+    name = (assignee or "").strip()
+    if not name:
+        return False
+    try:
+        from hermes_cli.profiles import profile_exists
+    except Exception:
+        return None
+    try:
+        return bool(profile_exists(name))
+    except Exception:
+        return None
 
 
 # --- Runs (attempt history on a task) ---
