@@ -752,6 +752,24 @@ def _whole_file_rewrite_hint(task_id: str, resolved: str | None, new_content: st
     )
 
 
+def _ledger_write_warning(result_dict: dict, path: str, tool: str) -> None:
+    """Attach the opt-in ``skills.write_guard`` notice to a tool result.
+
+    WARNING ONLY — never a refusal: a generic patch/write_file into ``HERMES_HOME/skills/``
+    bypasses the ledger's capture→append path and shows up as an unexplained chain break
+    (``tools.skill_ledger.skill_path_write_warning``). Off by default; fail-open.
+    """
+    try:
+        from tools import skill_ledger as _ledger
+        warning = _ledger.skill_path_write_warning(path, tool)
+    except Exception:
+        return
+    if not warning or result_dict.get("error"):
+        return
+    existing = result_dict.get("_warning")
+    result_dict["_warning"] = f"{existing} | {warning}" if existing else warning
+
+
 def write_file_tool(path: str, content: str, task_id: str = "default",
                     cross_profile: bool = False,
                     session_id: str | None = None) -> str:
@@ -788,6 +806,7 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             result_dict = _get_file_ops(task_id).write_file(_resolved or path, content).to_dict()
             if warnings:
                 result_dict["_warning"] = warnings[0]
+            _ledger_write_warning(result_dict, _resolved or path, "write_file")
             if rewrite_hint and not result_dict.get("error"):
                 result_dict["hint"] = rewrite_hint
             if _resolved:
@@ -887,6 +906,8 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
             result_dict = result.to_dict()
             if stale_warnings:
                 result_dict["_warning"] = " | ".join(stale_warnings)
+            for _p in _paths_to_check:
+                _ledger_write_warning(result_dict, _path_to_resolved.get(_p) or _p, "patch")
             if not result_dict.get("error"):
                 # Report the ABSOLUTE path(s) actually patched so a wrong-cwd
                 # mismatch is visible instead of silently landing elsewhere.

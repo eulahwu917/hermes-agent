@@ -158,7 +158,8 @@ Whole-run snapshots answer "undo everything the last curator pass did" — but s
 - **actor** — `curator` (background review fork / auto-transitions), `agent` (foreground agent tool calls), or `user` (CLI commands)
 - **action** — `create`, `edit`, `patch`, `delete`, `write_file`, `remove_file`, `archive`, `restore`, `purge`, `rollback`
 - **evidence** — delete intent (`absorbed_into` for consolidations, empty for prunes, and whether the recoverable-archive path handled it), triggering session id when available
-- **before/after** — per-file `{path, sha256}` manifests. File contents are stored content-addressed (deduped by hash) under `~/.hermes/.curator_backups/blobs/`, so a hundred entries touching the same unchanged file cost one blob.
+- **before/after** — per-file `{path, sha256}` manifests. File contents are stored content-addressed (deduped by hash) under `~/.hermes/.curator_backups/blobs/`, so a hundred entries touching the same unchanged file cost one blob. Derived artefacts (`__pycache__/*.pyc`, editor droppings) are never captured — the interpreter's churn is not a skill edit.
+- **chain_break** — `false`, `true`, or `"unverified"`, with `chain_break_basis` (`freshness` / `stale-sidecar` / `no-sidecar`) and the `chain_break_paths` that differ. It answers one narrow question: did this entry's captured `before` manifest continue *this writer's* last-known `after` manifest on a fresh ledger tail? `true` means a write reached the package between two ledgered mutations and was not itself recorded (the drift paths are named). `"unverified"` means the comparison could not be established — no last-known state, an unreadable sidecar, or another process appended since this writer's own last append (the check reads the shared ledger tail, it is not a lock). Never read `"unverified"` as a break. The last-known state lives in the process and in `~/.hermes/skills/.curator_ledger_chain.json` (safe to delete; the annotation then reports `"unverified"` until the next append re-establishes it).
 
 ```bash
 hermes curator ledger                  # newest 20 entries
@@ -173,6 +174,13 @@ The ledger is telemetry, never a gate — if writing an entry fails, the mutatio
 ```yaml
 skills:
   ledger: false
+```
+
+Generic `patch`/`write_file` writes into `~/hermes/skills/` bypass the ledger's capture→append path, which is what most `chain_break: true` entries report. To get a warning (never a refusal) when that happens, opt in:
+
+```yaml
+skills:
+  write_guard: true   # off by default
 ```
 
 ## Archive TTL purge
