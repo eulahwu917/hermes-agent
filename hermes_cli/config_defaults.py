@@ -1742,6 +1742,11 @@ DEFAULT_CONFIG = {
         # commands with a clear reason instead of silently degrading to pattern matching.
         # Setting true is the operator's explicit, recorded (config.yaml) acknowledgement
         # of degraded (pattern-matching-only) operation.
+        # Guard event ledger retention (tools/guard_events.py): the ledger keeps one 4 MiB
+        # generation plus ONE prior generation, and drops a prior generation older than this
+        # window at rotation. Raw override values/commands are never stored (digests only).
+        # The HERMES_GUARD_LEDGER_MAX_AGE_DAYS env var overrides this value.
+        "guard_event_ledger_max_age_days": 30,
         "website_blocklist": {"enabled": False, "domains": [], "shared_files": []},
         # IDs of supply-chain advisories the user has read and acted on; acked ones stop the startup
         # banner. Add via `hermes doctor --ack <id>`; remove by editing the list. Catalog:

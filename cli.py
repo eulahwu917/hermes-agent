@@ -2622,9 +2622,10 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin, 
             _tirith_enabled = (self.config.get("security", {}) or {}).get("tirith_enabled", True)
             if _tirith_enabled and not is_platform_supported():
                 # No tirith build exists for this platform, so the condition is PERMANENT: it must be
-                # visible BEFORE the first command instead of surfacing as a block. (Whether such a
-                # host fails closed by default is David's open decision — this banner states the
-                # behaviour that is actually configured, either way.)
+                # visible BEFORE the first command instead of surfacing as a block. David ruled
+                # (2026-09-15, D1) that such a host stays FAIL-CLOSED -- the banner therefore states
+                # the block, and names the three supported recovery routes (two of which sit outside
+                # the terminal gate, so a blocked host is a policy state, never a brick).
                 _fail_open = _load_security_config().get("tirith_fail_open", False)
                 if _fail_open:
                     _cprint(
@@ -2634,9 +2635,12 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin, 
                 else:
                     _cprint(
                         f"  {_DIM}⚠ tirith security scanner has no build for this platform — terminal "
-                        f"commands will be BLOCKED (fail-closed). Acknowledge degraded "
-                        f"(pattern-matching-only) operation with security.tirith_fail_open: true, or set "
-                        f"security.tirith_enabled: false to disable scanning.{_RST}"
+                        f"commands will be BLOCKED (fail-closed). Three supported recovery routes, none "
+                        f"needing a hand-edited config: restore a scanner, `hermes config set "
+                        f"security.tirith_fail_open true` to acknowledge degraded "
+                        f"(pattern-matching-only) operation, or `hermes config set security.tirith_enabled "
+                        f"false` to disable scanning. Both `hermes config set` routes run OUTSIDE the "
+                        f"terminal gate.{_RST}"
                     )
             elif ensure_installed(log_failures=False) is None and is_platform_supported() and _tirith_enabled:
                 _fail_open = _load_security_config().get("tirith_fail_open", False)
@@ -2648,9 +2652,10 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin, 
                 else:
                     _cprint(
                         f"  {_DIM}⚠ tirith security scanner enabled but not available — terminal "
-                        f"commands will be BLOCKED (fail-closed). Restore tirith, set "
-                        f"security.tirith_enabled: false, or acknowledge degraded mode with "
-                        f"security.tirith_fail_open: true.{_RST}"
+                        f"commands will be BLOCKED (fail-closed). Restore tirith, or run `hermes config "
+                        f"set security.tirith_fail_open true` to acknowledge degraded mode "
+                        f"(or `hermes config set security.tirith_enabled false` to disable scanning) — "
+                        f"both run outside the terminal gate.{_RST}"
                     )
         except Exception:
             pass

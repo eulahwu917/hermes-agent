@@ -12,6 +12,7 @@ from unittest.mock import patch
 import pytest
 
 import tools.approval as approval_module
+import tools.guard_events as guard_events
 from gateway.session_context import reset_session_vars
 from tools.approval import _Unattended, _unattended_deny
 from tools.approval_context import reset_current_session_key, set_current_session_key
@@ -277,7 +278,11 @@ class TestGuardEventLedger:
         rows = [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines()]
         row = rows[0]
         assert row["kind"] == "denied" and row["session"] == SESSION
-        assert row["var"] == "PYTHONPATH" and row["value"] == "/v"
+        assert row["var"] == "PYTHONPATH"
+        # D2 (David, 2026-09-15): the value and the command are identified by digest + length only.
+        assert row["value_digest"] == guard_events._digest("/v") and row["value_len"] == 2
+        assert row["command_digest"] == guard_events._digest("cmd") and row["command_len"] == 3
+        assert "value" not in row and "command" not in row
         assert row["outcome"] == "blocked"
 
     def test_carryover_event_on_admitted_fast_path(self, tmp_path, monkeypatch):
@@ -292,7 +297,8 @@ class TestGuardEventLedger:
         carry = next(r for r in rows if r["kind"] == "carryover")
         assert carry["outcome"] == "admitted"
         assert carry["source"] == str(script)
-        assert carry["value"] == DENIED_VAL
+        assert carry["value_digest"] == guard_events._digest(DENIED_VAL)
+        assert carry["value_len"] == len(DENIED_VAL)
 
     def test_remember_denied_persists_and_emits(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -301,7 +307,8 @@ class TestGuardEventLedger:
         ledger = tmp_path / "security" / "guard_events.jsonl"
         assert ledger.exists()
         rows = [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines()]
-        assert any(r["kind"] == "denied" and r["value"] == DENIED_VAL for r in rows)
+        assert any(r["kind"] == "denied"
+                   and r["value_digest"] == guard_events._digest(DENIED_VAL) for r in rows)
 
 
 class TestFullGateIntegration:
@@ -645,4 +652,165 @@ class TestCarryoverAuditCompleteness:
         assert [r["kind"] for r in rows] == ["denied"]
         assert rows[0]["outcome"] == "blocked"
         assert rows[0]["source"] == str(script)
-        assert rows[0]["value"] == DENIED_VAL
+        # D2: the ledger identifies the carried value by digest, never by raw text.
+        assert rows[0]["value_digest"] == guard_events._digest(DENIED_VAL)
+        assert "value" not in rows[0]
+
+
+# ---------------------------------------------------------------------------
+# D2 (ruled by David 2026-09-15) — the guard ledger stores DIGESTS, not raw text,
+# owner-only permissions, and a retention policy that is stated rather than implied.
+# ---------------------------------------------------------------------------
+
+class TestLedgerPrivacy:
+    """The ledger and the log must carry no raw override value and no raw command text."""
+
+    def test_no_raw_value_or_command_reaches_the_ledger_or_the_log(self, tmp_path, monkeypatch, caplog):
+        secret = "s3cr3t-override-value-9f2a"
+        command = f"env PYTHONPATH={secret} python3 -c x"
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        script = tmp_path / "carry.sh"
+        script.write_text(f"export PYTHONPATH={secret}\n", encoding="utf-8")
+        with caplog.at_level("WARNING", logger="tools.guard_events"):
+            approval_module._remember_denied_env_override(command)   # a DENIAL
+            _seed_denied(value=secret)
+            approval_module._approved_with_carryover_watch(f"bash {script}", str(tmp_path))  # a CARRYOVER
+
+        ledger = (tmp_path / "security" / "guard_events.jsonl").read_text(encoding="utf-8")
+        logged = "\n".join(r.getMessage() for r in caplog.records)
+        assert caplog.records, "the ledger writer must have logged its rows (non-vacuous control)"
+        for blob, where in ((ledger, "ledger"), (logged, "log")):
+            assert secret not in blob, f"raw value leaked into the {where}"
+            assert command not in blob, f"raw command leaked into the {where}"
+
+        rows = [json.loads(line) for line in ledger.splitlines()]
+        denied = [r for r in rows if r["kind"] == "denied"]
+        carry = [r for r in rows if r["kind"] == "carryover"]
+        assert denied and carry
+        # Correlation still works: the digest is stable and the length is kept.
+        assert denied[0]["value_digest"] == guard_events._digest(secret)
+        assert denied[0]["value_len"] == len(secret)
+        assert denied[0]["command_digest"] == guard_events._digest(command)
+        assert denied[0]["command_len"] == len(command)
+        assert carry[0]["value_digest"] == guard_events._digest(secret)
+        for row in rows:
+            assert "value" not in row and "command" not in row
+
+    def test_digest_is_stable_distinguishing_and_non_reversible(self):
+        import hashlib
+        assert guard_events._digest("abc") == guard_events._digest("abc")      # correlates repeats
+        assert guard_events._digest("abc") != guard_events._digest("abd")      # distinguishes values
+        assert guard_events._digest("abc") == hashlib.sha256(b"abc").hexdigest()
+        assert "abc" not in guard_events._digest("abc")
+
+
+class TestLedgerPermissions:
+    """Owner-only 0700 dir / 0600 file, enforced on the write path."""
+
+    def test_fresh_ledger_and_dir_are_owner_only(self, tmp_path, monkeypatch):
+        import stat
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        approval_module._record_guard_event("denied", SESSION, var="V", value="x", outcome="blocked")
+        d, f = tmp_path / "security", tmp_path / "security" / "guard_events.jsonl"
+        assert stat.S_IMODE(d.stat().st_mode) == 0o700
+        assert stat.S_IMODE(f.stat().st_mode) == 0o600
+
+    def test_wider_existing_modes_are_repaired_and_reported(self, tmp_path, monkeypatch, caplog):
+        import stat
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        d = tmp_path / "security"
+        d.mkdir()
+        os.chmod(d, 0o755)
+        f = d / "guard_events.jsonl"
+        f.write_text("", encoding="utf-8")
+        os.chmod(f, 0o664)
+        with caplog.at_level("WARNING", logger="tools.guard_events"):
+            approval_module._record_guard_event("denied", SESSION, var="V", value="x", outcome="blocked")
+        assert stat.S_IMODE(d.stat().st_mode) == 0o700
+        assert stat.S_IMODE(f.stat().st_mode) == 0o600
+        assert any("tightening" in r.getMessage() for r in caplog.records), \
+            "repairing a wider mode must be reported, never silent"
+
+    def test_owner_only_but_inexact_mode_is_normalised_never_widened(self, tmp_path, monkeypatch):
+        import stat
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        d = tmp_path / "security"
+        d.mkdir()
+        os.chmod(d, 0o700)
+        f = d / "guard_events.jsonl"
+        f.write_text("", encoding="utf-8")
+        os.chmod(f, 0o400)
+        approval_module._record_guard_event("denied", SESSION, var="V", value="x", outcome="blocked")
+        # Owner-only either way: normalised to the exact mode, and no group/other access appears.
+        assert stat.S_IMODE(f.stat().st_mode) == 0o600
+        assert stat.S_IMODE(f.stat().st_mode) & 0o077 == 0
+        # ... and the row was actually recorded: the write path is never a silent no-op.
+        assert [json.loads(line)["kind"] for line in f.read_text(encoding="utf-8").splitlines()] == ["denied"]
+
+    def test_group_readable_mode_is_repaired_and_never_left_mask_dependent(self, tmp_path, monkeypatch):
+        """Creation must not depend on umask: the file is owner-only even under a permissive umask."""
+        import stat
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        old = os.umask(0o000)
+        try:
+            approval_module._record_guard_event("denied", SESSION, var="V", value="x", outcome="blocked")
+        finally:
+            os.umask(old)
+        d, f = tmp_path / "security", tmp_path / "security" / "guard_events.jsonl"
+        assert stat.S_IMODE(d.stat().st_mode) == 0o700
+        assert stat.S_IMODE(f.stat().st_mode) == 0o600
+
+
+class TestLedgerRetention:
+    """Size cap + ONE prior generation + a maximum age applied at rotation; the knob is stated."""
+
+    def test_retention_window_reads_config_then_env(self, monkeypatch):
+        import hermes_cli.config as config_mod
+        monkeypatch.setattr(config_mod, "load_config_readonly",
+                            lambda: {"security": {"guard_event_ledger_max_age_days": 7}})
+        monkeypatch.delenv(guard_events.LEDGER_MAX_AGE_ENV, raising=False)
+        assert guard_events._max_age_seconds() == 7 * 86400
+        monkeypatch.setenv(guard_events.LEDGER_MAX_AGE_ENV, "2")
+        assert guard_events._max_age_seconds() == 2 * 86400                  # env overrides config
+        monkeypatch.setenv(guard_events.LEDGER_MAX_AGE_ENV, "not-a-number")
+        assert guard_events._max_age_seconds() == 7 * 86400                  # malformed falls back
+
+    def test_default_window_is_used_when_nothing_is_configured(self, monkeypatch):
+        import hermes_cli.config as config_mod
+        monkeypatch.setattr(config_mod, "load_config_readonly", lambda: {"security": {}})
+        monkeypatch.delenv(guard_events.LEDGER_MAX_AGE_ENV, raising=False)
+        assert guard_events._max_age_seconds() == guard_events.LEDGER_MAX_AGE_DAYS * 86400
+
+    def test_rotation_keeps_one_generation_and_drops_a_stale_prev(self, tmp_path, monkeypatch):
+        import stat
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv(guard_events.LEDGER_MAX_AGE_ENV, "1")
+        d = tmp_path / "security"
+        d.mkdir(mode=0o700)
+        live, prev = d / "guard_events.jsonl", d / "guard_events.jsonl.prev"
+        prev.write_text("STALE-GENERATION\n", encoding="utf-8")
+        old = time.time() - 2 * 86400
+        os.utime(prev, (old, old))
+        oversized = "x" * (guard_events.LEDGER_MAX_BYTES + 1)
+        live.write_text(oversized, encoding="utf-8")
+
+        approval_module._record_guard_event("denied", SESSION, var="V", value="x", outcome="blocked")
+
+        assert "STALE-GENERATION" not in prev.read_text(encoding="utf-8")
+        assert prev.read_text(encoding="utf-8") == oversized      # one generation, replaced not appended
+        assert stat.S_IMODE(prev.stat().st_mode) == 0o600
+        assert [json.loads(l)["kind"] for l in live.read_text(encoding="utf-8").splitlines()] == ["denied"]
+
+    def test_a_fresh_prev_is_overwritten_not_appended(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv(guard_events.LEDGER_MAX_AGE_ENV, "365")
+        d = tmp_path / "security"
+        d.mkdir(mode=0o700)
+        live, prev = d / "guard_events.jsonl", d / "guard_events.jsonl.prev"
+        prev.write_text("FIRST-ROTATION\n", encoding="utf-8")
+        live.write_text("y" * (guard_events.LEDGER_MAX_BYTES + 1), encoding="utf-8")
+
+        approval_module._record_guard_event("denied", SESSION, var="V", value="x", outcome="blocked")
+
+        assert prev.read_text(encoding="utf-8").strip("\n") == "y" * (guard_events.LEDGER_MAX_BYTES + 1)
+        assert "FIRST-ROTATION" not in prev.read_text(encoding="utf-8")

@@ -7,7 +7,8 @@ which DEFAULTS TO FAIL-CLOSED: the command is blocked with a clear reason instea
 silently proceeding with pattern matching only. Setting ``tirith_fail_open: true`` is the
 operator's explicit, recorded acknowledgement of degraded operation (the ``TIRITH_FAIL_OPEN``
 env var overrides it, and the source that actually took effect is recorded on every degraded
-decision).
+decision). Both the opt-in and ``tirith_enabled: false`` are reachable from OUTSIDE the terminal
+gate (``hermes config set``), so a blocked host is a policy state, never a brick.
 
 A degraded decision is never silent and never mistakable for an ordinary threat finding: the
 verdict carries a structured ``degradation`` record and each affected command appends a
@@ -688,11 +689,13 @@ def _crash(fail_open: bool, open_summary: str, closed_summary: str, *, reason: s
 
 # Remediation tail for fail-closed blocks: the fix direction plus the recorded-acknowledgement
 # escape hatch (security.tirith_fail_open: true). Kept OUT of the verdict when failing open.
-_ACK_HINT = ("Restore the scanner (tirith auto-installs to $HERMES_HOME/bin/tirith), set "
-             "security.tirith_enabled: false to disable scanning, or explicitly acknowledge "
-             "degraded (pattern-matching-only) operation with security.tirith_fail_open: true "
-             "(the TIRITH_FAIL_OPEN env var overrides it; the effective source is recorded on every "
-             "degraded decision).")
+_ACK_HINT = ("Three supported recovery routes, none of which needs hand-editing config: (1) restore "
+             "the scanner (tirith auto-installs to $HERMES_HOME/bin/tirith); (2) set "
+             "security.tirith_enabled: false to disable scanning; (3) explicitly acknowledge degraded "
+             "(pattern-matching-only) operation with security.tirith_fail_open: true. Routes 2 and 3 "
+             "are reachable from OUTSIDE this gate with `hermes config set ...` (or by hand-editing "
+             "config.yaml), so a blocked host is never a brick. The TIRITH_FAIL_OPEN env var overrides "
+             "route 3; the source that actually took effect is recorded on every degraded decision.")
 
 
 def check_command_security(command: str) -> dict:

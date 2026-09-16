@@ -1016,3 +1016,65 @@ class TestDegradationAttribution:
         assert result["action"] == "block"
         assert result["degradation"]["reason"] == "circuit_breaker"
         assert result["degradation"]["breaker_open"] is True
+
+
+# ---------------------------------------------------------------------------
+# D1 (ruled by David 2026-09-15) — an unsupported platform stays FAIL-CLOSED, and the
+# condition is visible BEFORE the first command in BOTH acknowledgement states.
+# ---------------------------------------------------------------------------
+
+class TestUnsupportedPlatformVisibility:
+    """Fail-closed stands for a host with no tirith build. Two things the ruling requires as
+    EVIDENCE rather than new behaviour: the pre-command banner covers the case in both states
+    (acknowledged and unacknowledged), and the gate really executes the unsupported-platform
+    BLOCK path (the existing test covers it; this pins the recovery text it must carry)."""
+
+    @staticmethod
+    def _banner(monkeypatch, capsys, tmp_path, *, fail_open, enabled=True):
+        import cli as cli_mod
+        import hermes_cli.config as config_mod
+        security = {"tirith_enabled": enabled, "tirith_fail_open": fail_open}
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.delenv("TIRITH_FAIL_OPEN", raising=False)
+        monkeypatch.setattr(config_mod, "load_config_readonly", lambda: {"security": dict(security)})
+        monkeypatch.setattr(_tirith_mod, "is_platform_supported", lambda: False)
+        app = cli_mod.HermesCLI.__new__(cli_mod.HermesCLI)
+        app._tirith_security_checked = False
+        app.config = {"security": dict(security)}
+        app._ensure_tirith_security()
+        return capsys.readouterr().out
+
+    def test_banner_names_the_condition_and_all_three_routes_when_unacknowledged(self, monkeypatch, capsys, tmp_path):
+        banner = self._banner(monkeypatch, capsys, tmp_path, fail_open=False)
+        assert banner, "the unsupported-platform condition must be visible BEFORE the first command"
+        assert "no build for this platform" in banner
+        assert "BLOCKED" in banner                                     # the configured behaviour
+        assert "tirith_fail_open" in banner and "tirith_enabled" in banner
+        assert "hermes config set" in banner                           # the ops CLI route
+        assert "outside the terminal gate" in banner.lower()           # ... which is why it is never a brick
+        assert "hand-edited config" in banner                          # no config hand-editing required
+
+    def test_banner_reports_the_acknowledged_state_without_claiming_a_block(self, monkeypatch, capsys, tmp_path):
+        banner = self._banner(monkeypatch, capsys, tmp_path, fail_open=True)
+        assert "no build for this platform" in banner
+        assert "pattern matching only" in banner
+        assert "acknowledged via security.tirith_fail_open: true" in banner
+        assert "BLOCKED" not in banner
+
+    def test_banner_is_absent_when_scanning_is_disabled(self, monkeypatch, capsys, tmp_path):
+        """tirith_enabled: false is the third recovery route -- it must not warn about a
+        condition the operator has already turned off."""
+        assert self._banner(monkeypatch, capsys, tmp_path, fail_open=False, enabled=False) == ""
+
+    @patch("tools.tirith_security._load_security_config")
+    def test_gate_block_names_the_same_recovery_routes(self, mock_cfg, monkeypatch, tmp_path, capsys):
+        """The block the operator actually hits must carry the same three routes as the banner."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        mock_cfg.return_value = {"tirith_enabled": True, "tirith_path": "tirith", "tirith_timeout": 5}
+        with patch("tools.tirith_security.is_platform_supported", return_value=False):
+            result = check_command_security("echo hi")
+        assert result["action"] == "block"                     # the BLOCK path executes
+        summary = result["summary"]
+        assert "hermes config set" in summary
+        assert "tirith_fail_open" in summary and "tirith_enabled" in summary
+        assert "never a brick" in summary

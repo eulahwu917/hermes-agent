@@ -3,7 +3,7 @@
 One append-only JSONL row per guard event, so denial / carryover / scanner-degradation
 transitions are reviewable without diffing transcripts. Both the approval layer
 (``tools.approval``) and the scanner wrapper (``tools.tirith_security``) write here, so the
-row schema and the rotation rule exist exactly once.
+row schema, the retention rule and the file permissions exist exactly once.
 
 Vocabulary -- these states are NOT interchangeable, and no consumer may relabel one as another:
 
@@ -24,29 +24,56 @@ Vocabulary -- these states are NOT interchangeable, and no consumer may relabel 
 A ledger write must NEVER be able to change a guard verdict: every failure path here is
 swallowed to a debug log.
 
-Raw-text policy (pending David's D2 ruling on the guard ledger)
-    The ``value`` / ``command`` fields of the ``denied`` and ``carryover`` rows are written as
-    raw, truncated text today, and the ledger file/dir permissions are not explicitly set
-    (umask default). Both are the subject of the open D2 decision (digests + force-redacted
-    excerpts + owner-only permissions, or an explicit retention/opt-in policy). Nothing in
-    this module changes that policy -- the degradation rows deliberately carry NO raw command
-    text, so the pending decision stays confined to the denial rows.
+Raw-text policy (D2, ruled by David 2026-09-15 -- DIGESTS, not raw text)
+    The ledger stores NO raw override value and NO raw command text. A ``denied`` / ``carryover``
+    row carries ``value_digest`` / ``command_digest`` (stable sha256 of the raw text, so a human can
+    still correlate repeats) plus light length metadata; ``var`` and ``source`` (a variable name and
+    an absolute script path, neither of which is raw command text) are kept as-is because they are
+    what makes a row attributable. No human-readable excerpt of the value or the command is written
+    at all -- if one is ever added it MUST go through the redactor
+    (``agent.redact.redact_sensitive_text(..., force=True)``), never a bare truncation.
+
+    Raw-value MATCHING deliberately does not depend on the ledger: it lives in the approval layer's
+    TTL'd, capped, in-memory per-session store (``tools.approval._denied_env_overrides``). Raw values
+    are never persisted in order to make correlation work.
+
+Permissions
+    The security directory and the ledger file are owner-only: ``0700`` / ``0600``, set explicitly and
+    idempotently on the write path (a creation mode alone is umask-masked). A mode that grants access to
+    anyone besides the owner is REPAIRED and reported at WARNING; the writer NEVER adds group/other
+    access, and a difference confined to the owner bits is normalised without a warning.
+
+Retention
+    ``LEDGER_MAX_BYTES``     size cap for the live ledger; exceeding it rotates. (module constant)
+    ``.prev``                exactly ONE previous generation is kept -- each rotation overwrites it,
+                             so archives do not accumulate.
+    ``LEDGER_MAX_AGE_DAYS``  a retained previous generation older than this is DELETED at the next
+                             rotation instead of being kept. The operator knob is
+                             ``security.guard_event_ledger_max_age_days`` in ``config.yaml``
+                             (declared in ``hermes_cli/config_defaults.py``), overridden by the
+                             ``HERMES_GUARD_LEDGER_MAX_AGE_DAYS`` environment variable.
 """
 
+import hashlib
 import json
 import logging
 import os
+import stat
 import time
+from contextlib import suppress
 
 from hermes_constants import get_hermes_home, hermes_home_key
 
 logger = logging.getLogger(__name__)
 
 LEDGER_MAX_BYTES = 4 * 1024 * 1024
+LEDGER_MAX_AGE_DAYS = 30
+LEDGER_MAX_AGE_ENV = "HERMES_GUARD_LEDGER_MAX_AGE_DAYS"
 LEDGER_DIR_NAME = "security"
 LEDGER_NAME = "guard_events.jsonl"
-_VALUE_MAX_CHARS = 500
-_COMMAND_MAX_CHARS = 1000
+LEDGER_DIR_MODE = 0o700
+LEDGER_FILE_MODE = 0o600
+_OTHER_ACCESS = 0o077  # group + other bits: access by any principal besides the owner
 _SOURCE_MAX_CHARS = 500
 
 KIND_DENIED = "denied"
@@ -74,12 +101,114 @@ def _profile_key() -> str:
         return ""
 
 
+def _digest(text: str) -> str:
+    """Stable, non-reversible digest of a raw value/command: equal inputs correlate, text does not survive."""
+    return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def _enforce_mode(path: str, mode: int, *, fd: int | None = None) -> None:
+    """Set the exact intended mode (idempotent); REPORT a change that removed non-owner access.
+
+    Never adds group/other access (the target mode grants none). A mode that differs only in its
+    owner bits is normalised without a warning -- that is not a security repair.
+    """
+    current = stat.S_IMODE(os.fstat(fd).st_mode if fd is not None else os.stat(path).st_mode)
+    if current == mode:
+        return
+    if current & _OTHER_ACCESS:
+        logger.warning("%s had mode %04o (accessible beyond the owner); tightening to %04o",
+                       path, current, mode)
+    if fd is not None:
+        os.fchmod(fd, mode)
+    else:
+        os.chmod(path, mode)
+
+
+def _ensure_private_dir(path: str) -> None:
+    """Create ``path`` owner-only (0700); REPAIR an existing wider mode and report it."""
+    os.makedirs(path, mode=LEDGER_DIR_MODE, exist_ok=True)
+    _enforce_mode(path, LEDGER_DIR_MODE)
+
+
+def _open_private_ledger(path: str) -> int:
+    """Open the ledger for append, created 0600; REPAIR an existing wider mode and report it.
+
+    The mode is enforced BEFORE the open when the file already exists, so a ledger whose owner bits
+    were narrowed (e.g. a stray ``0400``) is repaired instead of silently swallowing every row: the
+    write path must not become a silent no-op. Owner-only is preserved throughout -- the repair never
+    grants group/other access.
+    """
+    if os.path.exists(path):
+        with suppress(OSError):
+            _enforce_mode(path, LEDGER_FILE_MODE)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, LEDGER_FILE_MODE)
+    _enforce_mode(path, LEDGER_FILE_MODE, fd=fd)
+    return fd
+
+
+def _max_age_seconds() -> float:
+    """Retention window for a retained previous generation.
+
+    Operator knob: ``security.guard_event_ledger_max_age_days`` (config.yaml), overridden by the
+    ``HERMES_GUARD_LEDGER_MAX_AGE_DAYS`` environment variable; falls back to the module default.
+    Read per rotation (rare) so a config change applies without a restart, and never raises --
+    an unreadable config must not block a ledger write.
+    """
+    days: float | None = None
+    try:
+        from hermes_cli.config import load_config_readonly
+        raw = (load_config_readonly().get("security", {}) or {}).get("guard_event_ledger_max_age_days")
+        if raw is not None:
+            days = float(raw)
+    except Exception:
+        days = None
+    env = os.getenv(LEDGER_MAX_AGE_ENV)
+    if env:
+        try:
+            days = float(env)
+        except ValueError:
+            logger.warning("ignoring non-numeric %s=%r", LEDGER_MAX_AGE_ENV, env)
+    if days is None:
+        days = float(LEDGER_MAX_AGE_DAYS)
+    return max(0.0, days) * 86400.0
+
+
+def _rotate_if_needed(path: str) -> None:
+    """Rotate to a single ``.prev`` generation once the live ledger exceeds the size cap.
+
+    Retention at rotation: the stale prior generation is dropped when it is older than the
+    retention window, then the live file takes its place (so at most one prior generation is
+    ever retained, and it is never older than the window plus one rotation interval).
+    """
+    try:
+        if not os.path.isfile(path) or os.path.getsize(path) <= LEDGER_MAX_BYTES:
+            return
+    except OSError:
+        return
+    prev = path + ".prev"
+    max_age = _max_age_seconds()
+    try:
+        if os.path.exists(prev) and (time.time() - os.path.getmtime(prev)) > max_age:
+            logger.info("guard event ledger: dropping previous generation older than %.0f days",
+                        max_age / 86400.0)
+            os.unlink(prev)
+    except OSError:
+        pass
+    os.replace(path, prev)
+    try:
+        _enforce_mode(prev, LEDGER_FILE_MODE)
+    except OSError:
+        pass
+
+
 def record_guard_event(kind: str, session: str, *, outcome: str = "", var: str = "",
                        value: str = "", source: str = "", command: str = "", phase: str = "",
                        extra: dict | None = None) -> None:
     """Append one event row. Never raises -- callers are guard verdict paths.
 
-    ``var``/``value``/``source``/``command``/``phase`` are omitted from the row when empty so a
+    ``value`` and ``command`` are passed in RAW and never stored raw: the row gets
+    ``value_digest``/``value_len`` and ``command_digest``/``command_len`` instead (D2 -- digests,
+    not raw text). ``var``/``source``/``phase`` are omitted from the row when empty so a
     degradation row carries only its structured fields. ``extra`` merges additional
     event-specific fields (e.g. the degradation reason/paths/acknowledgement source).
     """
@@ -87,11 +216,14 @@ def record_guard_event(kind: str, session: str, *, outcome: str = "", var: str =
            "outcome": outcome}
     if var:
         row["var"] = var[:200]
-        row["value"] = value[:_VALUE_MAX_CHARS]
+    if value:
+        row["value_digest"] = _digest(value)
+        row["value_len"] = len(value)
     if source:
         row["source"] = source[:_SOURCE_MAX_CHARS]
     if command:
-        row["command"] = command[:_COMMAND_MAX_CHARS]
+        row["command_digest"] = _digest(command)
+        row["command_len"] = len(command)
     if phase:
         row["phase"] = phase
     if extra:
@@ -99,10 +231,12 @@ def record_guard_event(kind: str, session: str, *, outcome: str = "", var: str =
     logger.warning("[guard-event] %s", json.dumps(row, default=str))
     try:
         path = ledger_path()
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        if os.path.isfile(path) and os.path.getsize(path) > LEDGER_MAX_BYTES:
-            os.rename(path, path + ".prev")
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(row, default=str) + "\n")
+        _ensure_private_dir(os.path.dirname(path))
+        _rotate_if_needed(path)
+        fd = _open_private_ledger(path)
+        try:
+            os.write(fd, (json.dumps(row, default=str) + "\n").encode("utf-8"))
+        finally:
+            os.close(fd)
     except Exception as exc:  # never alter a guard verdict
         logger.debug("guard event ledger write failed: %s", exc)
