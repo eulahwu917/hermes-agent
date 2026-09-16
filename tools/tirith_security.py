@@ -103,7 +103,10 @@ _crash_count_by_home: dict[str, int] = {}
 _circuit_open_by_home: dict[str, bool] = {}
 _breaker_opened_at: float = 0.0        # monotonic ts the default-scope breaker opened (0 = unknown)
 _breaker_opened_at_by_home: dict[str, float] = {}
-_last_reprobe_at: float = 0.0          # monotonic ts of the last bounded re-probe attempt
+_last_reprobe_at: float = 0.0          # monotonic ts of the last bounded re-probe attempt (default scope)
+# Same per-scope budget for routed multiplex profiles: a shared slot let one broken profile
+# starve a restored sibling's recovery (see _breaker_reprobe_allowed).
+_last_reprobe_at_by_home: dict[str, float] = {}
 _breaker_lock = threading.Lock()
 # One re-probe per interval: bounded (a hot loop cannot hammer a broken binary) and enough for a
 # restored scanner to be picked up automatically.
@@ -173,33 +176,44 @@ def _reset_breaker() -> None:
         _crash_count_by_home.pop(scope, None)
         _circuit_open_by_home.pop(scope, None)
         _breaker_opened_at_by_home.pop(scope, None)
+        _last_reprobe_at_by_home.pop(scope, None)
         return
     _crash_count, _breaker_opened_at, _last_reprobe_at = 0, 0.0, 0.0
     _circuit_open = False
 
 
 def reset_circuit_breaker() -> None:
-    """Explicit supported reset: close the breaker for EVERY scope and clear all counters.
+    """Explicit supported reset: close every breaker, clear all counters AND the path cache.
 
     The operator-facing recovery action (and the test seam). Restoring the scanner alone may not
-    be enough while a re-probe is still waiting out its interval.
+    be enough while a re-probe is still waiting out its interval — and a cached resolved path that
+    no longer exists would make every re-probe fail against the dead location, so the path cache is
+    cleared too and resolution runs fresh.
     """
     global _crash_count, _circuit_open, _breaker_opened_at, _last_reprobe_at
+    global _resolved_path, _install_failure_reason
     _crash_count, _breaker_opened_at, _last_reprobe_at = 0, 0.0, 0.0
     _circuit_open = False
     _crash_count_by_home.clear()
     _circuit_open_by_home.clear()
     _breaker_opened_at_by_home.clear()
+    _last_reprobe_at_by_home.clear()
+    _resolved_path, _install_failure_reason = None, ""
+    _resolved_path_by_home.clear()
 
 
 def _breaker_reprobe_allowed() -> bool:
-    """True at most once per ``_BREAKER_REPROBE_INTERVAL_S``, process-wide.
+    """True at most once per ``_BREAKER_REPROBE_INTERVAL_S`` **per breaker scope**.
 
     The bounded recovery path: an open breaker still re-runs resolution + spawn occasionally, so a
     scanner restored after the trip resumes scanning without a process restart. A breaker whose
     open time was never recorded (legacy/test state) is NOT eligible — fail closed.
+
+    The budget is keyed by the same scope the failure counters use. A process-global slot let one
+    still-broken routed profile consume the retry window every interval, so a sibling profile whose
+    scanner had been restored could never get a re-probe and stayed dark indefinitely.
     """
-    global _last_reprobe_at, _breaker_opened_at
+    global _last_reprobe_at
     scope = _breaker_scope()
     opened_at = _breaker_opened_at_by_home.get(scope, 0.0) if scope else _breaker_opened_at
     if not opened_at:
@@ -208,9 +222,13 @@ def _breaker_reprobe_allowed() -> bool:
         now = time.monotonic()
         if now - opened_at < _BREAKER_REPROBE_INTERVAL_S:
             return False
-        if now - _last_reprobe_at < _BREAKER_REPROBE_INTERVAL_S:
+        last = _last_reprobe_at_by_home.get(scope, 0.0) if scope else _last_reprobe_at
+        if last and now - last < _BREAKER_REPROBE_INTERVAL_S:
             return False
-        _last_reprobe_at = now
+        if scope:
+            _last_reprobe_at_by_home[scope] = now
+        else:
+            _last_reprobe_at = now
         return True
 
 
@@ -225,10 +243,25 @@ def _warn_once(key: str, message: str, *args) -> None:
 
 
 def _cached_path() -> str | None:
-    """The path resolved on a previous call, or None if unresolved (None) / failed (_INSTALL_FAILED)."""
+    """The path resolved on a previous call, or None if unresolved (None) / failed (_INSTALL_FAILED).
+
+    NOTE: this deliberately does not stat the cached path on the hot path. A cache entry that has
+    gone stale is handled where it matters — the open-breaker RECOVERY path drops the cache before
+    re-resolving (see ``check_command_security`` / ``_forget_cached_path``), so a scanner restored
+    at a new configured/PATH location is found instead of the dead location being retried forever.
+    """
     if get_hermes_home_override() is not None:
         return _resolved_path_by_home.get(hermes_home_key())
-    return _resolved_path or None
+    return _resolved_path if isinstance(_resolved_path, str) else None
+
+
+def _forget_cached_path() -> None:
+    """Drop a cached resolved path (this scope only) so resolution runs again."""
+    global _resolved_path, _install_failure_reason
+    if get_hermes_home_override() is not None:
+        _resolved_path_by_home.pop(hermes_home_key(), None)
+    else:
+        _resolved_path, _install_failure_reason = None, ""
 
 
 def _store_resolved(path: str) -> None:
@@ -690,12 +723,13 @@ def _crash(fail_open: bool, open_summary: str, closed_summary: str, *, reason: s
 # Remediation tail for fail-closed blocks: the fix direction plus the recorded-acknowledgement
 # escape hatch (security.tirith_fail_open: true). Kept OUT of the verdict when failing open.
 _ACK_HINT = ("Three supported recovery routes, none of which needs hand-editing config: (1) restore "
-             "the scanner (tirith auto-installs to $HERMES_HOME/bin/tirith); (2) set "
-             "security.tirith_enabled: false to disable scanning; (3) explicitly acknowledge degraded "
-             "(pattern-matching-only) operation with security.tirith_fail_open: true. Routes 2 and 3 "
-             "are reachable from OUTSIDE this gate with `hermes config set ...` (or by hand-editing "
-             "config.yaml), so a blocked host is never a brick. The TIRITH_FAIL_OPEN env var overrides "
-             "route 3; the source that actually took effect is recorded on every degraded decision.")
+             "the scanner (tirith auto-installs to $HERMES_HOME/bin/tirith); (2) run "
+             "`hermes config set security.tirith_enabled false` to disable scanning; (3) explicitly "
+             "acknowledge degraded (pattern-matching-only) operation by running "
+             "`hermes config set security.tirith_fail_open true`. Routes 2 and 3 are reachable from "
+             "OUTSIDE this gate with `hermes config set`, so a blocked host is never a brick. The "
+             "TIRITH_FAIL_OPEN env var overrides route 3; the source that actually took effect is "
+             "recorded on every degraded decision.")
 
 
 def check_command_security(command: str) -> dict:
@@ -726,7 +760,11 @@ def check_command_security(command: str) -> dict:
                          "failures. Restore the scanner — scanning resumes automatically on the "
                          "next re-probe — or use the supported reset. " + _ACK_HINT,
                          reason=REASON_CIRCUIT_BREAKER, breaker_open=True)
-
+        # Recovery re-probe: drop the cached resolved path so resolution runs AGAIN. The cached
+        # path is very likely the one that just failed (removed / replaced binary); without this
+        # the re-probe re-spawns the dead location forever and never finds a scanner restored at a
+        # new configured/PATH location.
+        _forget_cached_path()
     # No binary for this platform, ever: skip the resolver so we never spawn.
     if not is_platform_supported():
         return _fail(fail_open, "tirith has no build for this platform",

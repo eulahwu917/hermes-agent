@@ -826,41 +826,61 @@ def _resolve_command_cwd(
     its workspace) is unusable in the sandbox — ``cd <host path>`` fails with
     exit 126 — so it is discarded in favor of ``default_cwd``.
 
+    On the LOCAL backend the result is an ABSOLUTE directory, resolved with the backend's own
+    normalization (``_resolve_local_initial_cwd``). The environment starts bash in the absolute form
+    of its initial cwd and the wrapper then runs ``builtin cd -- <command_cwd>`` from there, while a
+    relative path is resolved by the guard against the PROCESS cwd — so the same relative string
+    named one directory to the guard and another to the shell (``TERMINAL_CWD=project`` launched in
+    ``P``: ``P/project`` for the guard vs ``P/project/project`` for the shell, which would scan one
+    file and execute another). A relative per-call ``workdir`` is anchored to the session directory
+    the shell ``cd``s from, preserving its meaning while making it unambiguous.
+
     Same guard class as the env-creation sanitizers (#50636, #54447); this is the per-command sibling site.
     """
+    relative_workdir = False
     if workdir:
-        return workdir
-    recorded = get_session_cwd(session_key)
-    if recorded and _is_container_backend(env_type) and _is_unusable_container_cwd(recorded):
-        logger.info(
-            "Ignoring recorded session cwd %r for %s backend "
-            "(host/relative path won't work in sandbox). Using %r instead.",
-            recorded, env_type, default_cwd,
-        )
-        return default_cwd
-    if (
-        recorded
-        and env_type == "local"
-        and not os.path.isdir(recorded)
-    ):
-        # Local backend: a recorded cwd whose directory no longer exists (the
-        # classic case is a Kanban worktree removed after `hermes kanban
-        # archive`) would make the shell's defensive `cd <cwd>` prefix fail
-        # with exit 126 BEFORE the command runs — every bare terminal call in
-        # the session dies until the record is healed. workdir=-scoped calls
-        # never update the record (they are transient by contract), so the
-        # ghost persists across turns. Fall back to the default cwd instead;
-        # the next successful un-scoped command re-records a real directory.
-        # Remote backends are deliberately NOT covered: their recorded paths
-        # resolve inside the remote host/sandbox, so a local isdir() proves
-        # nothing about them.
-        logger.info(
-            "Ignoring recorded session cwd %r (directory no longer exists on "
-            "the local backend). Using %r instead.",
-            recorded, default_cwd,
-        )
-        return default_cwd
-    return recorded or default_cwd
+        resolved = workdir
+        relative_workdir = env_type == "local" and not os.path.isabs(os.path.expanduser(workdir))
+    else:
+        recorded = get_session_cwd(session_key)
+        if recorded and _is_container_backend(env_type) and _is_unusable_container_cwd(recorded):
+            logger.info(
+                "Ignoring recorded session cwd %r for %s backend "
+                "(host/relative path won't work in sandbox). Using %r instead.",
+                recorded, env_type, default_cwd,
+            )
+            resolved = default_cwd
+        elif (
+            recorded
+            and env_type == "local"
+            and not os.path.isdir(recorded)
+        ):
+            # Local backend: a recorded cwd whose directory no longer exists (the
+            # classic case is a Kanban worktree removed after `hermes kanban
+            # archive`) would make the shell's defensive `cd <cwd>` prefix fail
+            # with exit 126 BEFORE the command runs — every bare terminal call in
+            # the session dies until the record is healed. workdir=-scoped calls
+            # never update the record (they are transient by contract), so the
+            # ghost persists across turns. Fall back to the default cwd instead;
+            # the next successful un-scoped command re-records a real directory.
+            # Remote backends are deliberately NOT covered: their recorded paths
+            # resolve inside the remote host/sandbox, so a local isdir() proves
+            # nothing about them.
+            logger.info(
+                "Ignoring recorded session cwd %r (directory no longer exists on "
+                "the local backend). Using %r instead.",
+                recorded, default_cwd,
+            )
+            resolved = default_cwd
+        else:
+            resolved = recorded or default_cwd
+    if env_type != "local":
+        return resolved
+    from tools.environments.local import _resolve_local_initial_cwd
+    if relative_workdir:
+        base = get_session_cwd(session_key) or default_cwd
+        return os.path.normpath(os.path.join(_resolve_local_initial_cwd(base), resolved))
+    return _resolve_local_initial_cwd(resolved)
 
 
 def _error_json(error: str, *, exit_code: int = -1, status: Optional[str] = None, **extra) -> str:

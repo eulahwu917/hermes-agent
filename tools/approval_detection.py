@@ -1168,20 +1168,24 @@ def script_files_executed_by_command(command: str, cwd: str | None = None) -> li
     return out
 
 
-def _heredoc_delimiters(line: str) -> list[tuple[str, bool]]:
-    """Heredoc ``(delimiter, strip_tabs)`` pairs introduced on *line* (``<<EOF``, ``<<-EOF``,
-    ``<<'EOF'``), in order.
+def _heredoc_delimiters(line: str, quote: str | None = None) -> tuple[list[tuple[str, bool]], str | None]:
+    """Heredoc ``(delimiter, strip_tabs)`` pairs introduced on *line*, plus the quote state after it.
+
+    ``quote`` is the lexical context carried IN from the previous line, and the returned state must
+    be carried to the next one: ``<<`` is an operator only OUTSIDE a quote, so resetting the state
+    per line made an ordinary multi-line quoted string invent a heredoc (and then swallow the real
+    assignment that followed it).
 
     Scans with the shared quote-aware state machine so ``<<`` inside quotes is not an operator,
     and skips herestrings (``<<<``). Reads the delimiter word itself shell-style: a quoted or
     backslash-escaped word, otherwise up to the next metacharacter.
     """
-    delimiters, n = [], len(line)
-    steps = list(_scan_shell(line, comments=True))
-    for kind, i, j, quote in steps:
+    delimiters, n, state = [], len(line), quote
+    for kind, i, j, q in _scan_shell(line, comments=True, initial_quote=quote):
+        state = (None if q else line[i]) if kind == "quote" else q
         if kind == "comment":
             break
-        if kind != "char" or quote is not None or line[i] != "<":
+        if kind != "char" or q is not None or line[i] != "<":
             continue
         if i + 1 >= n or line[i + 1] != "<" or (i + 2 < n and line[i + 2] == "<"):
             continue
@@ -1211,7 +1215,7 @@ def _heredoc_delimiters(line: str) -> list[tuple[str, bool]]:
             pos += 1
         if word:
             delimiters.append(("".join(word), strip_tabs))
-    return delimiters
+    return delimiters, state
 
 
 def _strip_heredoc_bodies(text: str) -> str:
@@ -1220,17 +1224,27 @@ def _strip_heredoc_bodies(text: str) -> str:
     A script that documents the construct (``cat <<'EOF'`` … ``export PYTHONPATH=…`` … ``EOF``) does
     not execute the body, so treating those lines as statements is a false positive. Only the body
     and its terminator are dropped; the introducing line stays and is parsed normally.
+
+    Two shell rules the pre-pass must respect, or it trades a false positive for a false negative:
+
+    * the terminator line holds the delimiter ALONE — only leading TABs may be stripped, and only for
+      the ``<<-`` form. A space-prefixed `` EOF`` is body DATA, so ``strip()`` ended the body early
+      and parsed the literal lines after it as executed code;
+    * ``<<`` is an operator only OUTSIDE quotes. The quote state is carried across lines, so a
+      multi-line quoted string containing ``<<EOF`` neither invents a heredoc nor hides the real
+      assignment that follows the closing quote.
     """
-    out, pending = [], []
+    out, pending, quote = [], [], None
     for line in text.split("\n"):
         if pending:
             delimiter, strip_tabs = pending[0]
             candidate = line.lstrip("\t") if strip_tabs else line
-            if candidate.strip() == delimiter:
+            if candidate == delimiter:
                 pending.pop(0)
             continue  # body lines and the terminator are data
         out.append(line)
-        pending.extend(_heredoc_delimiters(line))
+        delimiters, quote = _heredoc_delimiters(line, quote)
+        pending.extend(delimiters)
     return "\n".join(out)
 
 
@@ -1260,7 +1274,7 @@ def _skip_shell_whitespace(command: str, pos: int) -> int:
 
 def _scan_shell(text: str, start: int = 0, end: int | None = None, *, subst: str = "",
                 brace: bool = False, stop_unterminated: bool = False, naive_backtick: bool = False,
-                comments: bool = False):
+                comments: bool = False, initial_quote: str | None = None):
     """Yield ``(kind, i, j, quote)`` lexical steps over ``text[start:end]`` without expanding.
 
     The single quote/escape state machine behind every detection scanner. ``kind`` is ``"char"``
@@ -1272,9 +1286,11 @@ def _scan_shell(text: str, start: int = 0, end: int | None = None, *, subst: str
     adds unquoted ``${...}``. An unterminated substitution falls through as plain chars unless
     *stop_unterminated*, which yields ``("subst", i, None, quote)`` and ends the scan (the caller
     descends to *end* itself). *naive_backtick* closes a backtick at the next backtick even if
-    escaped (the quoted-prose masker's historical behavior)."""
+    escaped (the quoted-prose masker's historical behavior). *initial_quote* seeds the lexical
+    context for a scan that continues from a previous line (a ``'``/``"`` left open there), so a
+    caller can preserve quote state across lines instead of resetting it per line."""
     n = len(text) if end is None else end
-    quote: str | None = None
+    quote: str | None = initial_quote
     i = start
     while i < n:
         ch = text[i]

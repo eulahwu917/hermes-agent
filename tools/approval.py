@@ -731,6 +731,17 @@ def _pending_result(spec, session_key: str, *, command: str, description: str,
     return result
 
 
+def _is_pending_result(result: dict) -> bool:
+    """True when the gate QUEUED the request for a human instead of refusing it.
+
+    ``_pending_result`` returns ``approved=False`` because nobody could answer yet — that is a
+    pending state, not a denial, and the two must never be relabelled as each other in the audit
+    trail. Real refusals come back as ``_denied``/``_blocked`` (no pending status).
+    """
+    return bool(result.get("approval_pending")) or result.get("status") in (
+        "pending_approval", "approval_required")
+
+
 # --- Unattended contexts (nobody present to answer a prompt) --------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -1532,6 +1543,13 @@ def check_all_command_guards(command: str, env_type: str,
         degradation=degradation,
     )
     if not result.get("approved"):
+        if _is_pending_result(result):
+            # PENDING is not DENIED: the request was queued for a human and nobody has answered.
+            # Recording a denial here fabricated a `blocked` row before the decision existed (and
+            # the states are documented as non-interchangeable). The pending→owner-approved replay
+            # audit stays on the replay path (`audit_replay_carryover`), and a value denied for real
+            # still records its row below.
+            return _with_degradation(result, degradation)
         # A denial does not need the env rule to be the blocking one: the VALUE carried
         # by the denied command is what gets tracked (extraction no-ops without a value).
         # A SCRIPTED carryover is recorded too — the command text is only `bash file.sh`, so

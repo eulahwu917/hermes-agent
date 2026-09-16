@@ -47,8 +47,9 @@ Retention
     ``LEDGER_MAX_BYTES``     size cap for the live ledger; exceeding it rotates. (module constant)
     ``.prev``                exactly ONE previous generation is kept -- each rotation overwrites it,
                              so archives do not accumulate.
-    ``LEDGER_MAX_AGE_DAYS``  a retained previous generation older than this is DELETED at the next
-                             rotation instead of being kept. The operator knob is
+    ``LEDGER_MAX_AGE_DAYS``  the age rule is applied to the generation rotation actually retains:
+                             a rotated ledger older than the window is NOT kept as ``.prev``. The
+                             operator knob is
                              ``security.guard_event_ledger_max_age_days`` in ``config.yaml``
                              (declared in ``hermes_cli/config_defaults.py``), overridden by the
                              ``HERMES_GUARD_LEDGER_MAX_AGE_DAYS`` environment variable.
@@ -176,29 +177,30 @@ def _max_age_seconds() -> float:
 def _rotate_if_needed(path: str) -> None:
     """Rotate to a single ``.prev`` generation once the live ledger exceeds the size cap.
 
-    Retention at rotation: the stale prior generation is dropped when it is older than the
-    retention window, then the live file takes its place (so at most one prior generation is
-    ever retained, and it is never older than the window plus one rotation interval).
+    Retention at rotation: the file that rotation actually RETAINS is the live ledger itself
+    (renamed aside to ``.prev``), so the maximum age is applied to THAT generation — the bytes
+    that are kept — and not to the older ``.prev`` that is about to be overwritten anyway. A
+    live ledger already older than the window is rotated out but NOT retained, so the window
+    genuinely bounds the retained data instead of being a knob that changes nothing.
     """
     try:
         if not os.path.isfile(path) or os.path.getsize(path) <= LEDGER_MAX_BYTES:
             return
+        retained_age = time.time() - os.path.getmtime(path)
     except OSError:
         return
     prev = path + ".prev"
     max_age = _max_age_seconds()
-    try:
-        if os.path.exists(prev) and (time.time() - os.path.getmtime(prev)) > max_age:
-            logger.info("guard event ledger: dropping previous generation older than %.0f days",
-                        max_age / 86400.0)
-            os.unlink(prev)
-    except OSError:
-        pass
     os.replace(path, prev)
     try:
         _enforce_mode(prev, LEDGER_FILE_MODE)
     except OSError:
         pass
+    if retained_age > max_age:
+        logger.info("guard event ledger: not retaining a rotated generation older than %.0f days",
+                    max_age / 86400.0)
+        with suppress(OSError):
+            os.unlink(prev)
 
 
 def record_guard_event(kind: str, session: str, *, outcome: str = "", var: str = "",

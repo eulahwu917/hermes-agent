@@ -416,6 +416,41 @@ class TestScriptHeuristicPrecision:
         p.write_text('echo "PYTHONPATH=/decoy"\necho PYTHONPATH=/decoy\n', encoding="utf-8")
         assert extract_env_override_assignments_from_file(str(p)) == []
 
+    def test_space_prefixed_line_inside_a_heredoc_is_body_data(self, tmp_path):
+        """F5 negative control: ` EOF` is BODY, not the terminator. `strip()` ended the body early
+        and parsed the literal export after it as EXECUTED code (a false positive that blocks docs)."""
+        p = tmp_path / "doc.sh"
+        p.write_text("cat <<'EOF'\n EOF\nexport PYTHONPATH=/documented\nEOF\necho done\n", encoding="utf-8")
+        assert extract_env_override_assignments_from_file(str(p)) == []
+
+    def test_tab_prefixed_line_is_body_data_for_a_plain_heredoc(self, tmp_path):
+        """Only the `<<-` form strips leading TABS; for a plain `<<` a tab-indented line is data."""
+        p = tmp_path / "doc.sh"
+        p.write_text("cat <<'EOF'\n\tEOF\nexport PYTHONPATH=/documented\nEOF\n", encoding="utf-8")
+        assert extract_env_override_assignments_from_file(str(p)) == []
+
+    def test_dash_heredoc_still_accepts_a_tab_indented_terminator(self, tmp_path):
+        """Positive control: `<<-` DOES strip leading tabs, so its body still ends properly."""
+        p = tmp_path / "doc.sh"
+        p.write_text("cat <<-EOF\n\texport PYTHONPATH=/documented\n\tEOF\necho done\n", encoding="utf-8")
+        assert extract_env_override_assignments_from_file(str(p)) == []
+
+    def test_multiline_quoted_text_does_not_invent_a_heredoc(self, tmp_path):
+        """F5 negative control: `<<EOF` inside an ordinary multi-line quoted string is not an
+        operator. Resetting quote state per line invented a heredoc and hid the REAL assignment
+        that follows the closing quote."""
+        p = tmp_path / "notes.sh"
+        p.write_text(f"printf '%s\\n' \"docs\n<<EOF\n\"\nexport PYTHONPATH={DENIED_VAL}\n", encoding="utf-8")
+        assert extract_env_override_assignments_from_file(str(p)) == [("PYTHONPATH", DENIED_VAL)]
+
+    def test_real_assignment_after_a_closed_heredoc_is_still_detected(self, tmp_path):
+        """Positive control: dropping the heredoc body must not swallow the code that follows it."""
+        p = tmp_path / "real.sh"
+        p.write_text(
+            f"cat <<'EOF'\nexport PYTHONPATH=/documented\nEOF\nexport PYTHONPATH={DENIED_VAL}\n",
+            encoding="utf-8")
+        assert extract_env_override_assignments_from_file(str(p)) == [("PYTHONPATH", DENIED_VAL)]
+
 
 # ---------------------------------------------------------------------------
 # F6 — the guard must inspect the file the command actually executes
@@ -493,6 +528,44 @@ class TestEffectiveCommandCwd:
         local = approval_module.check_all_command_guards(
             "bash carry.sh", "local", command_cwd=str(tmp_path))
         assert local["approved"] is False              # the local backend still inspects it
+
+    def test_no_record_relative_cwd_scans_the_file_the_shell_actually_runs(self, monkeypatch, tmp_path):
+        """Real execution control: a relative configured cwd with NO session record used to mean one
+        directory to the guard (process-cwd relative) and another to the shell (which starts in the
+        normalized dir and ``cd``s again). This runs a real LocalEnvironment and a real shell."""
+        import tools.terminal_tool as tt
+        from tools.environments.local import LocalEnvironment
+
+        launch = tmp_path / "P"
+        project = launch / "project"
+        nested = project / "project"
+        nested.mkdir(parents=True)
+        (project / "run.sh").write_text(
+            f"export PYTHONPATH={DENIED_VAL}\necho EXECUTED-TOP\n", encoding="utf-8")
+        (nested / "run.sh").write_text("echo EXECUTED-NESTED\n", encoding="utf-8")
+
+        monkeypatch.chdir(launch)
+        monkeypatch.setenv("TERMINAL_CWD", "project")
+        tt.clear_session_cwd(SESSION)
+
+        configured, _ = tt._resolve_config_cwd("local", False)
+        assert not os.path.isabs(configured)              # the repro's premise: a relative config cwd
+        command_cwd = tt._resolve_command_cwd(
+            workdir=None, default_cwd=configured, session_key=SESSION, env_type="local")
+        assert command_cwd == str(project)                # resolved ONCE, absolutely
+
+        env = LocalEnvironment(cwd=configured, timeout=10)
+        try:
+            out = env.execute("bash run.sh", cwd=command_cwd, timeout=10)
+        finally:
+            env.cleanup()
+        assert out["returncode"] == 0
+        assert "EXECUTED-TOP" in out["output"] and "EXECUTED-NESTED" not in out["output"]
+
+        # ...and the guard inspects run.sh in that SAME directory, not the nested decoy.
+        _seed_denied()
+        assert approval_module._reappearing_denied_overrides("bash run.sh", command_cwd) == [
+            ("PYTHONPATH", DENIED_VAL, str(project / "run.sh"))]
 
 
 # ---------------------------------------------------------------------------
@@ -656,6 +729,43 @@ class TestCarryoverAuditCompleteness:
         assert rows[0]["value_digest"] == guard_events._digest(DENIED_VAL)
         assert "value" not in rows[0]
 
+    def test_pending_carryover_is_not_recorded_as_a_denial(self, tmp_path, monkeypatch):
+        """Repro from report 5423: a gateway approval with no notifier/CLI callback queues the
+        request. Nobody has answered, so no `denied`/`blocked` row may exist — the states are
+        separate. The later owner-approved replay still gets its own admitted/replay audit."""
+        import hermes_cli.config as config_mod
+        import tools.tirith_security as tirith_mod
+        import tools.terminal_tool as tt
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(config_mod, "load_config_readonly", lambda: {"approvals": {}})
+        monkeypatch.setattr(tirith_mod, "check_command_security",
+                            lambda command: {"action": "allow", "findings": [], "summary": ""})
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_SINGLE_QUERY_SESSION", raising=False)
+        monkeypatch.setenv("HERMES_GATEWAY_SESSION", "1")     # a gateway session with no listener
+        script = tmp_path / "carry.sh"
+        script.write_text(f"export PYTHONPATH={DENIED_VAL}\n", encoding="utf-8")
+        _seed_denied()
+        ledger = tmp_path / "security" / "guard_events.jsonl"
+
+        result = approval_module.check_all_command_guards(
+            "bash carry.sh", "local", command_cwd=str(tmp_path))
+
+        assert result["approved"] is False
+        assert result["status"] == "pending_approval"         # PENDING, not denied
+        assert result.get("approval_pending") is True
+        rows = ([json.loads(l) for l in ledger.read_text(encoding="utf-8").splitlines()]
+                if ledger.exists() else [])
+        assert [r["kind"] for r in rows if r["kind"] in ("denied", "carryover")] == []
+
+        # The pending -> owner-approved transition keeps its own (admitted, replay) audit row.
+        verdict = tt._run_approval_guards("bash carry.sh", "local", {}, force=True,
+                                          command_cwd=str(tmp_path))
+        assert verdict.approved_run is True
+        rows = [json.loads(l) for l in ledger.read_text(encoding="utf-8").splitlines()]
+        assert [r["kind"] for r in rows if r["kind"] in ("denied", "carryover")] == ["carryover"]
+        assert rows[0]["outcome"] == "admitted" and rows[0]["phase"] == "replay"
+
 
 # ---------------------------------------------------------------------------
 # D2 (ruled by David 2026-09-15) — the guard ledger stores DIGESTS, not raw text,
@@ -814,3 +924,30 @@ class TestLedgerRetention:
 
         assert prev.read_text(encoding="utf-8").strip("\n") == "y" * (guard_events.LEDGER_MAX_BYTES + 1)
         assert "FIRST-ROTATION" not in prev.read_text(encoding="utf-8")
+
+    def test_age_rule_bounds_the_generation_that_is_actually_retained(self, tmp_path, monkeypatch):
+        """The window must change the RETAINED BYTES. Rotation retains the LIVE file it moves aside,
+        so an oversized live ledger already older than the window must not be kept — the previous
+        implementation age-checked the old ``.prev`` it was about to overwrite anyway."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        d = tmp_path / "security"
+        d.mkdir(mode=0o700)
+        live, prev = d / "guard_events.jsonl", d / "guard_events.jsonl.prev"
+        oversized = "z" * (guard_events.LEDGER_MAX_BYTES + 1)
+        stale = time.time() - 2 * 86400
+
+        # NEGATIVE: the window is shorter than the retained generation's age -> nothing is retained.
+        monkeypatch.setenv(guard_events.LEDGER_MAX_AGE_ENV, "1")
+        live.write_text(oversized, encoding="utf-8")
+        os.utime(live, (stale, stale))
+        approval_module._record_guard_event("denied", SESSION, var="V", value="x", outcome="blocked")
+        assert not prev.exists()
+        assert [json.loads(l)["kind"] for l in live.read_text(encoding="utf-8").splitlines()] == ["denied"]
+
+        # POSITIVE: the SAME oversized, aged ledger is retained once the window covers it — so the
+        # retained bytes provably depend on the knob.
+        monkeypatch.setenv(guard_events.LEDGER_MAX_AGE_ENV, "365")
+        live.write_text(oversized, encoding="utf-8")
+        os.utime(live, (stale, stale))
+        approval_module._record_guard_event("denied", SESSION, var="V", value="x", outcome="blocked")
+        assert prev.read_text(encoding="utf-8") == oversized

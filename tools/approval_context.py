@@ -305,12 +305,35 @@ def _get_unattended_approval_mode() -> str:
     return _binary_approval_mode("unattended_mode")
 
 
+def _env_fail_open() -> bool | None:
+    """``TIRITH_FAIL_OPEN`` as a boolean, or None when the variable is unset.
+
+    Same parse as ``tools.tirith_security._env_bool`` (the two must not disagree about what the
+    operator's environment says): unset -> None (no override), anything else -> truthy set test.
+    """
+    raw = os.getenv("TIRITH_FAIL_OPEN")
+    if raw is None:
+        return None
+    return raw.strip().lower() in {"1", "true", "yes"}
+
+
 def _tirith_fail_open() -> bool:
-    """``security.tirith_fail_open`` (default False: fail closed).
-    False means an unavailable scanner must not silently grant access — the command is
-    blocked. True is the operator's explicit, recorded acknowledgement of degraded
-    (pattern-matching-only) operation, and lives in config.yaml. An unreadable config
-    also fails closed: without a readable config there is no acknowledgement to honour."""
+    """The EFFECTIVE ``security.tirith_fail_open`` policy (default False: fail closed).
+
+    The env override is resolved FIRST, exactly as ``tools.tirith_security._load_security_config``
+    does, because that is the value the rest of the process acts on and the value
+    :func:`tirith_fail_open_source` reports. Resolving the value from config alone while reporting
+    an existing ``TIRITH_FAIL_OPEN`` as the source made the two disagree on an ImportError: a
+    command could be allowed on the config value while the event alleged the env (or blocked while
+    alleging the env acknowledged it).
+
+    False means an unavailable scanner must not silently grant access — the command is blocked.
+    True is the operator's explicit, recorded acknowledgement of degraded (pattern-matching-only)
+    operation. An unreadable config also fails closed: without a readable config there is no
+    acknowledgement to honour.
+    """
+    if (env := _env_fail_open()) is not None:
+        return env
     try:
         from hermes_cli.config import load_config_readonly
         _sec = (load_config_readonly() or {}).get("security", {}) or {}
@@ -320,15 +343,18 @@ def _tirith_fail_open() -> bool:
 
 
 def tirith_fail_open_source() -> str:
-    """Where the fail-open acknowledgement actually comes from.
+    """Where the fail-open acknowledgement actually comes from — the source of the EFFECTIVE value.
 
     ``env:TIRITH_FAIL_OPEN``                the process env var overrides config, so this is NOT
                                             the recorded config.yaml acknowledgement.
     ``config:security.tirith_fail_open``    the sanctioned, recorded acknowledgement.
     ``unreadable_config``                   no readable config, so no acknowledgement exists
                                             (and the resolver fails closed).
+
+    Kept consistent with :func:`_tirith_fail_open`: both read the same override first, so the
+    reported source always describes the value that was actually applied.
     """
-    if os.getenv("TIRITH_FAIL_OPEN") is not None:
+    if _env_fail_open() is not None:
         return "env:TIRITH_FAIL_OPEN"
     try:
         from hermes_cli.config import load_config_readonly

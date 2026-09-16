@@ -944,6 +944,74 @@ class TestCircuitBreakerRecovery:
                  patch("tools.tirith_security.subprocess.run", return_value=_mock_run(0, _json_stdout())):
                 assert check_command_security("echo hi")["action"] == "allow"
 
+    @patch("tools.tirith_security._load_security_config")
+    def test_reprobe_re_resolves_a_stale_cached_path(self, mock_cfg, tmp_path, monkeypatch):
+        """Recovery must RE-RESOLVE through the real resolver: the cached path is usually the binary
+        that just failed, so a re-probe that re-spawns it never discovers a scanner restored at a
+        new configured location. Only the spawn is mocked here."""
+        old_dir, new_dir = tmp_path / "old", tmp_path / "new"
+        old_dir.mkdir(), new_dir.mkdir()
+        old, new = old_dir / "tirith", new_dir / "tirith"
+        for exe in (old, new):
+            exe.write_text("#!/bin/sh\n", encoding="utf-8")
+            exe.chmod(0o755)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.delenv("TIRITH_FAIL_OPEN", raising=False)
+        # Pin the default (process-global) breaker/path scope so the assertion reads the slot this
+        # execution path uses, and give the REAL resolver a configured location to find.
+        monkeypatch.setattr(_tirith_mod, "get_hermes_home_override", lambda: None)
+        mock_cfg.return_value = {"tirith_enabled": True, "tirith_path": str(new),
+                                 "tirith_timeout": 5, "tirith_fail_open": False}
+        _tirith_mod._resolved_path = str(old)          # cached from before the scanner was replaced
+        _tirith_mod._circuit_open = True               # the breaker tripped on that dead path
+        _tirith_mod._crash_count = _tirith_mod._CRASH_LIMIT
+        _tirith_mod._breaker_opened_at = time.monotonic() - (_tirith_mod._BREAKER_REPROBE_INTERVAL_S + 1)
+        _tirith_mod._last_reprobe_at = 0.0
+        os.unlink(old)                                 # the previously resolved binary is gone
+
+        with patch("tools.tirith_security.subprocess.run", return_value=_mock_run(0, _json_stdout())):
+            result = check_command_security("echo hi")
+
+        assert result["action"] == "allow"
+        assert "degradation" not in result             # a real scan, not a degraded decision
+        assert _tirith_mod._resolved_path == str(new)  # re-resolved to the restored location
+        assert _tirith_mod._circuit_open is False      # and healed without a restart
+
+    @patch("tools.tirith_security._load_security_config")
+    def test_a_still_broken_profile_cannot_starve_a_siblings_recovery(self, mock_cfg):
+        """Both breakers are already OPEN. A broken A consumes its own retry slot every interval;
+        with a process-global budget that also consumed B's, so a restored B could never re-probe.
+        The budget is per scope."""
+        mock_cfg.return_value = {"tirith_enabled": True, "tirith_path": "tirith", "tirith_timeout": 5}
+        scope_a, scope_b = "/profiles/a", "/profiles/b"
+        for scope in (scope_a, scope_b):
+            with patch("tools.tirith_security._breaker_scope", return_value=scope), \
+                 patch("tools.tirith_security._resolve_tirith_path", return_value=f"{scope}/missing"), \
+                 patch("tools.tirith_security.subprocess.run", side_effect=FileNotFoundError("gone")):
+                for _ in range(_tirith_mod._CRASH_LIMIT):
+                    assert check_command_security("echo hi")["action"] == "block"
+        assert _tirith_mod._circuit_open_by_home[scope_a] is True
+        assert _tirith_mod._circuit_open_by_home[scope_b] is True
+
+        elapsed = time.monotonic() - (_tirith_mod._BREAKER_REPROBE_INTERVAL_S + 1)
+        _tirith_mod._breaker_opened_at_by_home[scope_a] = elapsed
+        _tirith_mod._breaker_opened_at_by_home[scope_b] = elapsed
+        _tirith_mod._last_reprobe_at_by_home.clear()
+        _tirith_mod._last_reprobe_at = 0.0
+
+        # A is still broken and takes its own retry slot this interval...
+        with patch("tools.tirith_security._breaker_scope", return_value=scope_a), \
+             patch("tools.tirith_security._resolve_tirith_path", return_value="/profiles/a/missing"), \
+             patch("tools.tirith_security.subprocess.run", side_effect=FileNotFoundError("gone")):
+            assert check_command_security("echo hi")["action"] == "block"
+
+        # ...and B, whose scanner has been restored, must STILL get its re-probe and recover.
+        with patch("tools.tirith_security._breaker_scope", return_value=scope_b), \
+             patch("tools.tirith_security._resolve_tirith_path", return_value="/profiles/b/tirith"), \
+             patch("tools.tirith_security.subprocess.run", return_value=_mock_run(0, _json_stdout())):
+            assert check_command_security("echo hi")["action"] == "allow"
+        assert _tirith_mod._circuit_open_by_home.get(scope_b) is not True
+
 
 # ---------------------------------------------------------------------------
 # F4 — every degraded command is loud AND attributable (gate report 5400)
@@ -993,6 +1061,53 @@ class TestDegradationAttribution:
              patch("tools.tirith_security.subprocess.run", side_effect=FileNotFoundError("gone")):
             result = check_command_security("echo hi")
         assert result["degradation"]["acknowledgement_source"] == "env:TIRITH_FAIL_OPEN"
+
+    def test_effective_value_and_reported_source_agree_on_every_conflict(self, monkeypatch):
+        """F4: the ImportError consumers use the fail-open VALUE for the decision and the SOURCE for
+        the event. Config alone vs env-whenever-it-exists made those two disagree, so the resolver
+        and the source report must read the SAME override first."""
+        import hermes_cli.config as config_mod
+        from tools.approval_context import _tirith_fail_open, tirith_fail_open_source
+
+        cases = [
+            ({"security": {"tirith_fail_open": True}}, "0", False, "env:TIRITH_FAIL_OPEN"),
+            ({"security": {"tirith_fail_open": False}}, "1", True, "env:TIRITH_FAIL_OPEN"),
+            ({"security": {"tirith_fail_open": True}}, None, True, "config:security.tirith_fail_open"),
+            ({"security": {"tirith_fail_open": False}}, None, False, "config:security.tirith_fail_open"),
+        ]
+        for cfg, env, expected_value, expected_source in cases:
+            monkeypatch.setattr(config_mod, "load_config_readonly", lambda c=cfg: c)
+            if env is None:
+                monkeypatch.delenv("TIRITH_FAIL_OPEN", raising=False)
+            else:
+                monkeypatch.setenv("TIRITH_FAIL_OPEN", env)
+            assert _tirith_fail_open() is expected_value, (cfg, env)
+            assert tirith_fail_open_source() == expected_source, (cfg, env)
+
+    def test_import_error_consumer_applies_and_reports_the_same_conflicting_setting(self, monkeypatch, tmp_path):
+        """config true / env 0 and config false / env 1: the ImportError path must BLOCK on the env
+        value while recording the env as the effective source (and allow, likewise) — never decide
+        on one and allege the other."""
+        import hermes_cli.config as config_mod
+        from tools import approval as approval_module
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
+
+        monkeypatch.setattr(config_mod, "load_config_readonly",
+                            lambda: {"security": {"tirith_fail_open": True}})
+        monkeypatch.setenv("TIRITH_FAIL_OPEN", "0")
+        closed = approval_module._unimportable_scanner_result(approval_module._tirith_fail_open())
+        assert closed["action"] == "warn"                       # env 0 => closure
+        assert closed["degradation"]["acknowledgement_source"] == "env:TIRITH_FAIL_OPEN"
+        assert closed["degradation"]["outcome"] == "blocked"
+
+        monkeypatch.setattr(config_mod, "load_config_readonly",
+                            lambda: {"security": {"tirith_fail_open": False}})
+        monkeypatch.setenv("TIRITH_FAIL_OPEN", "1")
+        opened = approval_module._unimportable_scanner_result(approval_module._tirith_fail_open())
+        assert opened["action"] == "allow"                      # env 1 => acknowledged
+        assert opened["degradation"]["acknowledgement_source"] == "env:TIRITH_FAIL_OPEN"
+        assert opened["degradation"]["outcome"] == "allowed"
 
     @patch("tools.tirith_security._load_security_config")
     def test_unsupported_platform_branch_is_attributed(self, mock_cfg, tmp_path, monkeypatch):
@@ -1068,13 +1183,18 @@ class TestUnsupportedPlatformVisibility:
 
     @patch("tools.tirith_security._load_security_config")
     def test_gate_block_names_the_same_recovery_routes(self, mock_cfg, monkeypatch, tmp_path, capsys):
-        """The block the operator actually hits must carry the same three routes as the banner."""
+        """The block the operator actually hits must carry the same three routes as the banner —
+        as the exact RUNNABLE commands, not a `hermes config set …` placeholder, and with no
+        recommendation to hand-edit config.yaml."""
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         mock_cfg.return_value = {"tirith_enabled": True, "tirith_path": "tirith", "tirith_timeout": 5}
         with patch("tools.tirith_security.is_platform_supported", return_value=False):
             result = check_command_security("echo hi")
         assert result["action"] == "block"                     # the BLOCK path executes
         summary = result["summary"]
-        assert "hermes config set" in summary
-        assert "tirith_fail_open" in summary and "tirith_enabled" in summary
+        assert "hermes config set security.tirith_fail_open true" in summary
+        assert "hermes config set security.tirith_enabled false" in summary
         assert "never a brick" in summary
+        assert "outside this gate" in summary.lower()          # the ops-CLI routes sit outside the gate
+        assert "hand-editing config.yaml" not in summary       # no hand-edit recommendation
+        assert "(or by hand-editing" not in summary
