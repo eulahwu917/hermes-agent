@@ -319,6 +319,25 @@ def _tirith_fail_open() -> bool:
         return False
 
 
+def tirith_fail_open_source() -> str:
+    """Where the fail-open acknowledgement actually comes from.
+
+    ``env:TIRITH_FAIL_OPEN``                the process env var overrides config, so this is NOT
+                                            the recorded config.yaml acknowledgement.
+    ``config:security.tirith_fail_open``    the sanctioned, recorded acknowledgement.
+    ``unreadable_config``                   no readable config, so no acknowledgement exists
+                                            (and the resolver fails closed).
+    """
+    if os.getenv("TIRITH_FAIL_OPEN") is not None:
+        return "env:TIRITH_FAIL_OPEN"
+    try:
+        from hermes_cli.config import load_config_readonly
+        load_config_readonly() or {}
+    except Exception:
+        return "unreadable_config"
+    return "config:security.tirith_fail_open"
+
+
 def _get_approval_transport_config() -> tuple[str, str | None]:
     """Return explicitly selected transport and fail-closed fallback mode."""
     try:

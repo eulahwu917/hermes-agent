@@ -240,22 +240,32 @@ def test_dispatcher_threads_delivery_mode_to_backend(grant_computer_use_approval
 @pytest.fixture
 def _interactive_session(monkeypatch):
     """Interactive CLI presence for the shared gate plus a fresh approval session key; grants made here are
-    wiped from ``tools.approval``'s store afterwards so nothing leaks between tests."""
+    wiped from ``tools.approval``'s store afterwards so nothing leaks between tests.
+
+    The approval session ContextVar is restored from the token each ``use()`` returned, in reverse
+    order. The previous form (``reset_current_session_key(set_current_session_key(""))``) restored
+    the CONTAMINATED value instead of the pre-fixture one, leaving the ambient session key pointing
+    at this test's key for every later module in the same process.
+    """
     from tools import approval
     from tools.approval_context import reset_current_session_key, set_current_session_key
 
     monkeypatch.setenv("HERMES_INTERACTIVE", "1")
     monkeypatch.setattr(approval, "save_permanent_allowlist", lambda patterns: None)
     keys: list[str] = []
+    tokens: list = []
 
     def use(session_key: str):
         keys.append(session_key)
-        return set_current_session_key(session_key)
+        token = set_current_session_key(session_key)
+        tokens.append(token)
+        return token
 
     yield use
     for key in keys:
         approval.clear_session(key)
-    reset_current_session_key(set_current_session_key(""))
+    for token in reversed(tokens):
+        reset_current_session_key(token)
 
 
 def test_background_approval_does_not_authorize_foreground(_interactive_session):

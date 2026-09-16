@@ -15,24 +15,27 @@ from tools.tirith_security import check_command_security, ensure_installed
 
 
 @pytest.fixture(autouse=True)
-def _reset_resolved_path():
+def _reset_resolved_path(tmp_path, monkeypatch):
     """Pre-set cached path to skip auto-install in scan tests.
     Tests that specifically test ensure_installed / resolve behavior
     reset this to None themselves.
+
+    HERMES_HOME is redirected to a per-test tmp dir: every unavailability branch now appends a
+    guard-ledger row, and a unit test must not write into the operator's real
+    ``$HERMES_HOME/security/guard_events.jsonl``.
     """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     _tirith_mod._resolved_path = "tirith"
     _tirith_mod._install_thread = None
     _tirith_mod._install_failure_reason = ""
-    _tirith_mod._crash_count = 0
-    _tirith_mod._circuit_open = False
-    _tirith_mod._circuit_open_at = 0.0
+    _tirith_mod.reset_circuit_breaker()
+
     yield
     _tirith_mod._resolved_path = None
     _tirith_mod._install_thread = None
     _tirith_mod._install_failure_reason = ""
-    _tirith_mod._crash_count = 0
-    _tirith_mod._circuit_open = False
-    _tirith_mod._circuit_open_at = 0.0
+    _tirith_mod.reset_circuit_breaker()
+
 
 
 # ---------------------------------------------------------------------------
@@ -864,3 +867,152 @@ class TestMkdtempOSErrorNoSpace:
             _install_tirith(log_failures=False)
         after = set(glob.glob("/tmp/tirith-install-*"))
         assert after - before == set()
+
+
+# ---------------------------------------------------------------------------
+# F7 — the breaker must RECOVER (gate report 5400: it used to be un-healable)
+# ---------------------------------------------------------------------------
+
+def _ledger_rows(home):
+    import json
+    path = os.path.join(str(home), "security", "guard_events.jsonl")
+    with open(path, encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+class TestCircuitBreakerRecovery:
+    """An open breaker used to return before resolution/spawn on EVERY later call: a completed
+    install (or a restored binary) never resumed scanning, and the failure count was global to the
+    process, so one profile's broken scanner blocked its siblings."""
+
+    @patch("tools.tirith_security._load_security_config")
+    def test_bounded_reprobe_recovers_after_the_scanner_returns(self, mock_cfg, tmp_path):
+        mock_cfg.return_value = {"tirith_enabled": True, "tirith_path": "tirith", "tirith_timeout": 5}
+        with patch("tools.tirith_security._resolve_tirith_path", return_value="/missing/tirith"), \
+             patch("tools.tirith_security.subprocess.run", side_effect=FileNotFoundError("gone")):
+            for _ in range(_tirith_mod._CRASH_LIMIT):
+                assert check_command_security("echo hi")["action"] == "block"
+        assert _tirith_mod._circuit_open is True
+        # Still closed to new commands before the interval elapses.
+        assert check_command_security("echo hi")["action"] == "block"
+        # Age the trip past the re-probe interval and give it a working scanner.
+        _tirith_mod._breaker_opened_at = time.monotonic() - (_tirith_mod._BREAKER_REPROBE_INTERVAL_S + 1)
+        _tirith_mod._last_reprobe_at = 0.0
+        with patch("tools.tirith_security._resolve_tirith_path", return_value="/restored/tirith"), \
+             patch("tools.tirith_security.subprocess.run", return_value=_mock_run(0, _json_stdout())):
+            result = check_command_security("echo hi")
+        assert result["action"] == "allow"
+        assert "degradation" not in result          # a real scan, not a degraded decision
+        assert _tirith_mod._circuit_open is False    # healed without a restart
+        assert _tirith_mod._crash_count == 0
+
+    @patch("tools.tirith_security._load_security_config")
+    def test_resolution_success_clears_the_breaker(self, mock_cfg):
+        """A completed install / resolved binary closes the breaker immediately."""
+        mock_cfg.return_value = {"tirith_enabled": True, "tirith_path": "tirith", "tirith_timeout": 5}
+        _tirith_mod._circuit_open = True
+        _tirith_mod._crash_count = _tirith_mod._CRASH_LIMIT
+        _tirith_mod._breaker_opened_at = time.monotonic()
+        _tirith_mod._set_resolved("/now/available/tirith")
+        assert _tirith_mod._circuit_open is False
+        assert _tirith_mod._crash_count == 0
+
+    def test_explicit_reset_action_closes_every_scope(self):
+        _tirith_mod._circuit_open = True
+        _tirith_mod._crash_count = 99
+        _tirith_mod._breaker_opened_at = time.monotonic()
+        _tirith_mod._circuit_open_by_home["/some/profile/home"] = True
+        _tirith_mod.reset_circuit_breaker()
+        assert _tirith_mod._circuit_open is False
+        assert _tirith_mod._crash_count == 0
+        assert _tirith_mod._circuit_open_by_home == {}
+
+    @patch("tools.tirith_security._load_security_config")
+    def test_breaker_is_scoped_per_hermes_home(self, mock_cfg, tmp_path):
+        """One routed profile's failures must not stop scanning for a sibling profile."""
+        mock_cfg.return_value = {"tirith_enabled": True, "tirith_path": "tirith", "tirith_timeout": 5}
+        scope_a, scope_b = "/profiles/a", "/profiles/b"
+        with patch("tools.tirith_security._breaker_scope", return_value=scope_a):
+            with patch("tools.tirith_security._resolve_tirith_path", return_value="/missing/tirith"), \
+                 patch("tools.tirith_security.subprocess.run", side_effect=FileNotFoundError("gone")):
+                for _ in range(_tirith_mod._CRASH_LIMIT):
+                    check_command_security("echo hi")
+            assert _tirith_mod._breaker_open() is True
+        with patch("tools.tirith_security._breaker_scope", return_value=scope_b):
+            assert _tirith_mod._breaker_open() is False   # sibling scope unaffected
+            with patch("tools.tirith_security._resolve_tirith_path", return_value="/profiles/b/tirith"), \
+                 patch("tools.tirith_security.subprocess.run", return_value=_mock_run(0, _json_stdout())):
+                assert check_command_security("echo hi")["action"] == "allow"
+
+
+# ---------------------------------------------------------------------------
+# F4 — every degraded command is loud AND attributable (gate report 5400)
+# ---------------------------------------------------------------------------
+
+class TestDegradationAttribution:
+    @patch("tools.tirith_security._load_security_config")
+    def test_every_affected_command_gets_its_own_row(self, mock_cfg, tmp_path, monkeypatch):
+        """The old warnings were process-deduplicated: the ledger must fire per command."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        mock_cfg.return_value = {"tirith_enabled": True, "tirith_path": "tirith",
+                                 "tirith_timeout": 5, "tirith_fail_open": True}
+        with patch("tools.tirith_security._resolve_tirith_path", return_value="/missing/tirith"), \
+             patch("tools.tirith_security.subprocess.run", side_effect=FileNotFoundError("gone")):
+            first = check_command_security("echo one")
+            second = check_command_security("echo two")
+        rows = [r for r in _ledger_rows(tmp_path) if r["kind"] == "degradation"]
+        assert len(rows) == 2
+        assert rows[0]["reason"] == "spawn_failed"
+        assert rows[0]["outcome"] == "allowed"          # the ACKNOWLEDGED (fail-open) path too
+        assert rows[0]["attempted_path"] == "tirith"
+        assert rows[0]["breaker_open"] is False
+        assert rows[0]["acknowledgement_source"] == "config:security.tirith_fail_open"
+        assert first["degradation"]["reason"] == second["degradation"]["reason"] == "spawn_failed"
+
+    @patch("tools.tirith_security._load_security_config")
+    def test_fail_closed_row_records_the_blocked_outcome(self, mock_cfg, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        mock_cfg.return_value = {"tirith_enabled": True, "tirith_path": "tirith",
+                                 "tirith_timeout": 5}    # no acknowledgement -> fail closed
+        with patch("tools.tirith_security._resolve_tirith_path", return_value="/missing/tirith"), \
+             patch("tools.tirith_security.subprocess.run", side_effect=FileNotFoundError("gone")):
+            result = check_command_security("echo hi")
+        assert result["action"] == "block"
+        assert result["degradation"]["outcome"] == "blocked"
+        assert [r["outcome"] for r in _ledger_rows(tmp_path) if r["kind"] == "degradation"] == ["blocked"]
+
+    @patch("tools.tirith_security._load_security_config")
+    def test_env_override_is_recorded_as_the_actual_source(self, mock_cfg, tmp_path, monkeypatch):
+        """TIRITH_FAIL_OPEN overrides config, so 'recorded in config.yaml' is not universally
+        true — the effective source must be recorded."""
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("TIRITH_FAIL_OPEN", "1")
+        mock_cfg.return_value = {"tirith_enabled": True, "tirith_path": "tirith",
+                                 "tirith_timeout": 5, "tirith_fail_open": False}
+        with patch("tools.tirith_security._resolve_tirith_path", return_value="/missing/tirith"), \
+             patch("tools.tirith_security.subprocess.run", side_effect=FileNotFoundError("gone")):
+            result = check_command_security("echo hi")
+        assert result["degradation"]["acknowledgement_source"] == "env:TIRITH_FAIL_OPEN"
+
+    @patch("tools.tirith_security._load_security_config")
+    def test_unsupported_platform_branch_is_attributed(self, mock_cfg, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        mock_cfg.return_value = {"tirith_enabled": True, "tirith_path": "tirith",
+                                 "tirith_timeout": 5, "tirith_fail_open": True}
+        with patch("tools.tirith_security.is_platform_supported", return_value=False):
+            result = check_command_security("echo hi")
+        assert result["action"] == "allow"
+        assert result["degradation"]["reason"] == "unsupported_platform"
+        rows = [r for r in _ledger_rows(tmp_path) if r["kind"] == "degradation"]
+        assert rows and rows[-1]["reason"] == "unsupported_platform"
+
+    @patch("tools.tirith_security._load_security_config")
+    def test_breaker_branch_is_attributed_with_breaker_state(self, mock_cfg, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        mock_cfg.return_value = {"tirith_enabled": True, "tirith_path": "tirith", "tirith_timeout": 5}
+        _tirith_mod._circuit_open = True
+        _tirith_mod._breaker_opened_at = time.monotonic()
+        result = check_command_security("echo hi")
+        assert result["action"] == "block"
+        assert result["degradation"]["reason"] == "circuit_breaker"
+        assert result["degradation"]["breaker_open"] is True

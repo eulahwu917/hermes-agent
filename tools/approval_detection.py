@@ -1004,7 +1004,13 @@ def _execution_flag_findings(command: str):
 _ENV_HIJACK_VARS = ("PYTHONPATH",)
 ENV_OVERRIDE_HIJACK_DESCRIPTION = "interpreter-hijack environment variable assignment (PYTHONPATH)"
 _SHELL_SCRIPT_EXECUTABLES = frozenset({"bash", "sh", "zsh", "ksh", "dash", "fish", "ash", "source", "."})
-_SHELL_INLINE_CODE_FLAGS = frozenset({"-c", "-lc", "-e", "--command"})
+# ``-c`` (and any single-dash bundle containing it, e.g. ``-lc``): the next argument is inline CODE,
+# never a file. ``-e`` is NOT here — it is errexit, and ``sh -e script.sh`` really does run the file.
+_SHELL_INLINE_CODE_FLAGS = frozenset({"-c", "-lc", "--command"})
+# Syntax-check-only mode: ``bash -n file.sh`` (and any single-dash bundle containing ``n``) PARSES the
+# file and never executes its body, so the file is not a carrier of anything at run time. Long options
+# are excluded: ``--norc`` / ``--noprofile`` contain an ``n`` but do NOT stop execution.
+_SHELL_SYNTAX_ONLY_FLAGS = frozenset({"-n", "--noexec"})
 _SCRIPT_SCAN_MAX_BYTES = 256 * 1024
 _SCRIPT_SCAN_MAX_LINES = 4000
 
@@ -1066,31 +1072,40 @@ def _env_override_hijack_findings(command: str):
             yield (ENV_OVERRIDE_HIJACK_DESCRIPTION, "PYTHONPATH")
 
 
+def _segment_env_override_assignments(segment: str) -> list:
+    """Tracked PYTHONPATH assignments in ONE top-level shell segment.
+
+    The single structural rule shared by the command-text extractor and the script-content
+    extractor, so both accept exactly the same forms: leading ``NAME=value`` assignment words
+    (``PYTHONPATH=v cmd``, ``FOO=1 PYTHONPATH=v cmd``) and the ``export``/``env`` word form
+    (including an assignment run before the word). Tokenization starts at index 0 because the
+    executable-name span iterator SKIPS leading assignment words — they are not executables —
+    and those are exactly what this rule must see.
+    """
+    tokens = _shell_segment_tokens(segment, 0)
+    if not tokens:
+        return []
+    pairs, i = [], 0
+    while i < len(tokens):
+        m = _is_env_assignment_token(tokens[i])
+        if m is None:
+            break
+        if m[0] in _ENV_HIJACK_VARS:
+            pairs.append(m)
+        i += 1
+    if i < len(tokens) and os.path.basename(_deobfuscate_shell_word_for_detection(tokens[i])).lower() in ("export", "env"):
+        pairs.extend(_assignment_pairs_from_tokens(tokens[i + 1:]))
+    return pairs
+
+
 def extract_env_override_assignments(command: str) -> list:
     """Tracked PYTHONPATH assignments carried by *command* in any plain spelling, for
     value-tracking: prefix assignments (``PYTHONPATH=v cmd``), ``export``/``env`` word forms,
     and an assignment run before the word (``FOO=1 env PYTHONPATH=v cmd``). The spaced
     ``NAME = value`` form is NOT extracted (not a POSIX assignment). Obfuscated spellings are
     by-design non-coverage."""
-    pairs = []
-    for segment in _iter_top_level_shell_segments(command):
-        # Tokenize from index 0: the executable-name span iterator SKIPS leading assignment
-        # words by design (they are not executables), and those are exactly what this
-        # extractor must see.
-        tokens = _shell_segment_tokens(segment, 0)
-        if not tokens:
-            continue
-        i = 0
-        while i < len(tokens):
-            m = _is_env_assignment_token(tokens[i])
-            if m is None:
-                break
-            if m[0] in _ENV_HIJACK_VARS:
-                pairs.append(m)
-            i += 1
-        if i < len(tokens) and os.path.basename(_deobfuscate_shell_word_for_detection(tokens[i])).lower() in ("export", "env"):
-            pairs.extend(_assignment_pairs_from_tokens(tokens[i + 1:]))
-    return pairs
+    return [pair for segment in _iter_top_level_shell_segments(command)
+            for pair in _segment_env_override_assignments(segment)]
 
 
 def script_files_executed_by_command(command: str, cwd: str | None = None) -> list:
@@ -1098,8 +1113,11 @@ def script_files_executed_by_command(command: str, cwd: str | None = None) -> li
 
     Bounded heuristic for the guard's value-tracking layer: ``bash script.sh``, ``sh -eu
     script.sh``, ``./script.sh``, absolute script paths. Inline-code flags (``-c``…) never
-    produce a file. A relative path resolves against *cwd* or the process cwd; missing/unreadable
-    files are simply absent (the callers must never block on that).
+    produce a file, and syntax-check-only invocations (``bash -n file.sh``) are not execution:
+    the shell parses the file and never runs its body. A relative path resolves against *cwd* or
+    the process cwd; missing/unreadable files are simply absent (the callers must never block on
+    that). Options that take a SEPARATE argument (``sh -o pipefail file.sh``) are not modelled —
+    the heuristic is best-effort by contract.
     """
     out = []
     for segment in _iter_top_level_shell_segments(command):
@@ -1112,18 +1130,23 @@ def script_files_executed_by_command(command: str, cwd: str | None = None) -> li
         name0 = os.path.basename(_deobfuscate_shell_word_for_detection(tokens[0])).lower()
         candidate = None
         if name0 in _SHELL_SCRIPT_EXECUTABLES:
-            inline_code = False
+            inline_code = syntax_only = False
             for token in tokens[1:]:
-                if token in _SHELL_INLINE_CODE_FLAGS:
-                    inline_code = True
-                    break
                 if token == "--":
                     break
+                if token in _SHELL_INLINE_CODE_FLAGS or (
+                        not token.startswith("--") and token.startswith("-") and "c" in token[1:]):
+                    inline_code = True
+                    break
+                if token in _SHELL_SYNTAX_ONLY_FLAGS or (
+                        not token.startswith("--") and token.startswith("-") and "n" in token[1:]):
+                    syntax_only = True
+                    continue
                 if token.startswith("-"):
                     continue
                 candidate = token
                 break
-            if inline_code:
+            if inline_code or syntax_only:
                 continue
         elif ((tokens[0].startswith(("./", "../", "/")) or tokens[0].endswith(".sh"))
                 and not tokens[0].startswith("-")):
@@ -1145,37 +1168,88 @@ def script_files_executed_by_command(command: str, cwd: str | None = None) -> li
     return out
 
 
+def _heredoc_delimiters(line: str) -> list[tuple[str, bool]]:
+    """Heredoc ``(delimiter, strip_tabs)`` pairs introduced on *line* (``<<EOF``, ``<<-EOF``,
+    ``<<'EOF'``), in order.
+
+    Scans with the shared quote-aware state machine so ``<<`` inside quotes is not an operator,
+    and skips herestrings (``<<<``). Reads the delimiter word itself shell-style: a quoted or
+    backslash-escaped word, otherwise up to the next metacharacter.
+    """
+    delimiters, n = [], len(line)
+    steps = list(_scan_shell(line, comments=True))
+    for kind, i, j, quote in steps:
+        if kind == "comment":
+            break
+        if kind != "char" or quote is not None or line[i] != "<":
+            continue
+        if i + 1 >= n or line[i + 1] != "<" or (i + 2 < n and line[i + 2] == "<"):
+            continue
+        pos = i + 2
+        strip_tabs = pos < n and line[pos] == "-"
+        if strip_tabs:
+            pos += 1
+        while pos < n and line[pos] in " \t":
+            pos += 1
+        word, quote_char = [], None
+        while pos < n:
+            ch = line[pos]
+            if quote_char:
+                if ch == quote_char:
+                    quote_char = None
+                else:
+                    word.append(ch)
+            elif ch in "'\"":
+                quote_char = ch
+            elif ch == "\\" and pos + 1 < n:
+                pos += 1
+                word.append(line[pos])
+            elif ch in " \t;&|<>()":
+                break
+            else:
+                word.append(ch)
+            pos += 1
+        if word:
+            delimiters.append(("".join(word), strip_tabs))
+    return delimiters
+
+
+def _strip_heredoc_bodies(text: str) -> str:
+    """Blank out heredoc bodies (and their terminator lines) so literal DATA is not read as shell.
+
+    A script that documents the construct (``cat <<'EOF'`` … ``export PYTHONPATH=…`` … ``EOF``) does
+    not execute the body, so treating those lines as statements is a false positive. Only the body
+    and its terminator are dropped; the introducing line stays and is parsed normally.
+    """
+    out, pending = [], []
+    for line in text.split("\n"):
+        if pending:
+            delimiter, strip_tabs = pending[0]
+            candidate = line.lstrip("\t") if strip_tabs else line
+            if candidate.strip() == delimiter:
+                pending.pop(0)
+            continue  # body lines and the terminator are data
+        out.append(line)
+        pending.extend(_heredoc_delimiters(line))
+    return "\n".join(out)
+
+
 def extract_env_override_assignments_from_file(path: str) -> list:
-    """Tracked PYTHONPATH assignments in a script's shell lines (structurally positioned):
-    leading assignment statements, ``export``/``env`` word forms, spaced ``=`` form. Reads are
-    bounded; any I/O or parse error yields an empty result (never a block by itself)."""
-    pairs = []
+    """Tracked PYTHONPATH assignments in a script's executed shell code.
+
+    Uses the SAME top-level segment parser as the command-text extractor, so both accept exactly
+    the same forms (including ordinary ``export PYTHONPATH=/x;`` and ``set -eu; export
+    PYTHONPATH=/x``, whose value must keep the real path with no trailing ``;``). Heredoc bodies
+    and their terminators are dropped first: they are literal data, not statements. Reads are
+    bounded; any I/O or parse error yields an empty result (never a block by itself).
+    """
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
-            lines = [f.readline() for _ in range(_SCRIPT_SCAN_MAX_LINES)]
+            text = "".join(f.readline() for _ in range(_SCRIPT_SCAN_MAX_LINES))
     except OSError:
-        return pairs
-    for line in lines:
-        if not line or not line.strip():
-            continue
-        try:
-            lexer = shlex.shlex(line, posix=True, punctuation_chars="<>")
-            lexer.whitespace_split, lexer.commenters = True, "#"
-            tokens = list(lexer)
-        except ValueError:
-            continue
-        if not tokens:
-            continue
-        if os.path.basename(tokens[0]).lower() in ("export", "env"):
-            pairs.extend(_assignment_pairs_from_tokens(tokens[1:]))
-            continue
-        for token in tokens:
-            m = _is_env_assignment_token(token)
-            if m is None:
-                break
-            if m[0] in _ENV_HIJACK_VARS:
-                pairs.append(m)
-    return pairs
+        return []
+    return [pair for segment in _iter_top_level_shell_segments(_strip_heredoc_bodies(text))
+            for pair in _segment_env_override_assignments(segment)]
 
 
 def _skip_shell_whitespace(command: str, pos: int) -> int:

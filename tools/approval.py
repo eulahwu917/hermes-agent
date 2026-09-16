@@ -14,7 +14,6 @@ call time; sibling-defined names are imported from their defining module.
 from dataclasses import dataclass
 import hashlib
 import importlib
-import json
 import logging
 import os
 import threading
@@ -27,7 +26,7 @@ from tools.approval_context import (
     _get_session_platform, _is_cron_approval_context,
     _is_gateway_approval_context, _is_interactive_cli, _is_single_query_approval_context,
     _is_unattended_platform_approval_context, _resolve_cli_approval_callback, _should_fall_through_to_cli_approval,
-    _tirith_fail_open, get_current_session_key,
+    _tirith_fail_open, get_current_session_key, tirith_fail_open_source,
 )
 from tools.approval_detection import (
     ENV_OVERRIDE_HIJACK_DESCRIPTION, _approval_key_aliases, _check_sudo_stdin_guard,
@@ -40,6 +39,10 @@ from tools.approval_floors import (
 from tools.approval_gateway_wait import _await_gateway_decision
 from tools.approval_prompt import _present_with_selected_transport, _transport_choice, prompt_dangerous_approval
 from tools.approval_smart import _smart_verdict
+from tools.guard_events import (
+    KIND_CARRYOVER, KIND_DEGRADATION, KIND_DENIED, OUTCOME_ADMITTED, OUTCOME_ALLOWED,
+    OUTCOME_BLOCKED, PHASE_APPROVAL, PHASE_REPLAY, record_guard_event,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -117,53 +120,43 @@ def _denial_breaker_addendum(session_key: str) -> str:
 # --- Denied environment-override tracking (R2: follow the VALUE) + re-route events (R3) -----------------------
 # A denied interpreter-hijack override (tirith ``interpreter_hijack_env`` or the pattern layer's parity rule) is
 # remembered by (variable, VALUE), not by spelling, so the same value carried by an executed script or any plain
-# re-spelling is recognized. Events are both a logger line and an append-only JSONL ledger under
-# $HERMES_HOME/security/guard_events.jsonl — reviewable without diffing transcripts.
+# re-spelling is recognized. Events go to the shared guard event ledger (``tools.guard_events``) — ONE writer for
+# both this module and the scanner wrapper, so the row schema and the kind/outcome/phase vocabulary exist once.
 _DENIED_OVERRIDE_TTL_S = 1800  # "shortly after in the same session" window
 _DENIED_OVERRIDE_MAX_PER_SESSION = 16
 _DENIED_OVERRIDE_MAX_SESSIONS = 256
 _denied_env_overrides: dict[str, dict[tuple[str, str], float]] = {}
-_GUARD_EVENT_LEDGER_MAX_BYTES = 4 * 1024 * 1024
 ENV_OVERRIDE_CARRYOVER_KEY = "previously denied environment override reappearing (value-tracked)"
 
 
-def _record_guard_event(kind: str, session_key: str, *, var: str, value: str, outcome: str,
-                        command: str = "", source: str = "") -> None:
+def _record_guard_event(kind: str, session_key: str, *, var: str = "", value: str = "",
+                        outcome: str, command: str = "", source: str = "", phase: str = "",
+                        extra: dict | None = None) -> None:
     """Surface a denial-tracking event. The ledger write must NEVER affect a guard verdict."""
-    logger.warning(
-        "[guard-denial-event] kind=%s session=%s %s=%r outcome=%s%s command=%r",
-        kind, session_key, var, value[:300], outcome,
-        (f" source={source}" if source else ""), command[:900],
-    )
-    try:
-        from hermes_constants import get_hermes_home
-        log_dir = os.path.join(str(get_hermes_home()), "security")
-        os.makedirs(log_dir, exist_ok=True)
-        ledger_path = os.path.join(log_dir, "guard_events.jsonl")
-        if os.path.isfile(ledger_path) and os.path.getsize(ledger_path) > _GUARD_EVENT_LEDGER_MAX_BYTES:
-            os.rename(ledger_path, ledger_path + ".prev")
-        with open(ledger_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps({
-                "ts": time.time(), "kind": kind, "session": session_key, "var": var,
-                "value": value[:500], "outcome": outcome, "source": source[:500],
-                "command": command[:1000],
-            }) + "\n")
-    except Exception as exc:  # never alter a guard verdict
-        logger.debug("guard event ledger write failed: %s", exc)
+    record_guard_event(kind, session_key, var=var, value=value, outcome=outcome,
+                       command=command, source=source, phase=phase, extra=extra)
 
 
-def _remember_denied_env_override(command: str) -> None:
+def _remember_denied_env_override(command: str, carried: list[tuple[str, str, str]] | None = None) -> None:
     """Persist the env-override (variable, value) pairs carried by a DENIED command and emit the
-    denial event row, so the same VALUE reappearing later in the session is recognized."""
+    denial event rows, so the same VALUE reappearing later in the session is recognized.
+
+    ``carried`` holds ``(var, value, source)`` pairs found in the CONTENT of a script the denied
+    command plainly executes. The command text alone is just ``bash file.sh``, so without this the
+    interactive rejection of a scripted carryover records nothing even though the recurrence was
+    already known. Those pairs were tracked when first denied; re-recording them here attributes
+    the rejection to the script that carried them.
+    """
     from tools.approval_detection import extract_env_override_assignments
     entries = extract_env_override_assignments(command)
-    if not entries:
+    carried = list(carried or [])
+    if not entries and not carried:
         return
     session_key = get_current_session_key()
     now = time.time()
     with _lock:
         bucket = _denied_env_overrides.setdefault(session_key, {})
-        for var, value in entries:
+        for var, value in list(entries) + [(var, value) for var, value, _ in carried]:
             bucket[(var, value)] = now
         while len(bucket) > _DENIED_OVERRIDE_MAX_PER_SESSION:
             oldest = min(bucket, key=bucket.get)
@@ -171,8 +164,12 @@ def _remember_denied_env_override(command: str) -> None:
         while len(_denied_env_overrides) > _DENIED_OVERRIDE_MAX_SESSIONS:
             _denied_env_overrides.pop(next(iter(_denied_env_overrides)), None)
     for var, value in entries:
-        _record_guard_event("denied", session_key, var=var, value=value,
-                            outcome="blocked", command=command)
+        _record_guard_event(KIND_DENIED, session_key, var=var, value=value,
+                            outcome=OUTCOME_BLOCKED, command=command, phase=PHASE_APPROVAL)
+    for var, value, source in carried:
+        _record_guard_event(KIND_DENIED, session_key, var=var, value=value,
+                            outcome=OUTCOME_BLOCKED, command=command, source=source,
+                            phase=PHASE_APPROVAL)
 
 
 def _recently_denied_env_overrides(session_key: str) -> list[tuple[str, str]]:
@@ -189,10 +186,16 @@ def _recently_denied_env_overrides(session_key: str) -> list[tuple[str, str]]:
         return list(fresh)
 
 
-def _reappearing_denied_overrides(command: str, cwd: str | None = None) -> list[tuple[str, str, str]]:
+def _reappearing_denied_overrides(command: str, cwd: str | None = None, *,
+                                  inspect_local_scripts: bool = True) -> list[tuple[str, str, str]]:
     """(variable, value, source) entries where a previously DENIED override value re-appears in
     *command* or in the content of a script file it plainly executes. Source is "command" or
-    the absolute script path. Token-splicing obfuscation is by-design non-coverage."""
+    the absolute script path. Token-splicing obfuscation is by-design non-coverage.
+
+    ``inspect_local_scripts`` is False when the command does not run on THIS host (a remote or
+    sandboxed backend): its ``bash run.sh`` executes the remote file of that name, so reading a
+    same-named local file would either miss the real carrier or block on an unrelated one.
+    """
     from tools.approval_detection import (
         extract_env_override_assignments,
         extract_env_override_assignments_from_file,
@@ -207,6 +210,8 @@ def _reappearing_denied_overrides(command: str, cwd: str | None = None) -> list[
         if (var, value) in denied and (var, value) not in seen:
             seen.add((var, value))
             out.append((var, value, "command"))
+    if not inspect_local_scripts:
+        return out
     for path in script_files_executed_by_command(command, cwd):
         for var, value in extract_env_override_assignments_from_file(path):
             if (var, value) in denied and (var, value) not in seen:
@@ -215,14 +220,39 @@ def _reappearing_denied_overrides(command: str, cwd: str | None = None) -> list[
     return out
 
 
-def _approved_with_carryover_watch(command: str, command_cwd: str | None = None) -> dict:
-    """Approved fast-path (yolo / mode=off / allowlist / approve-context / isolated container):
-    still emit a carryover event when a denied override reappears, so a re-routed denial is
-    VISIBLE without re-blocking these explicitly-trusted paths."""
-    for var, value, source in _reappearing_denied_overrides(command, command_cwd):
-        _record_guard_event("carryover", get_current_session_key(), var=var, value=value,
-                            outcome="admitted", command=command, source=source)
+def _carryover_watch(command: str, command_cwd: str | None = None, *, phase: str = PHASE_APPROVAL,
+                     inspect_local_scripts: bool = True) -> list[tuple[str, str, str]]:
+    """Emit an ``admitted`` ledger event per re-appearing denied value on a path that does NOT
+    re-block (yolo / mode=off / allowlist / approve-context / isolated container / owner replay),
+    then return them. This is an AUDIT event only: the value is admitted, not denied, and the
+    event is not evidence that the command executed.
+    """
+    recurring = _reappearing_denied_overrides(command, command_cwd,
+                                              inspect_local_scripts=inspect_local_scripts)
+    for var, value, source in recurring:
+        _record_guard_event(KIND_CARRYOVER, get_current_session_key(), var=var, value=value,
+                            outcome=OUTCOME_ADMITTED, command=command, source=source, phase=phase)
+    return recurring
+
+
+def _approved_with_carryover_watch(command: str, command_cwd: str | None = None, *,
+                                   phase: str = PHASE_APPROVAL,
+                                   inspect_local_scripts: bool = True) -> dict:
+    """Approved fast-path: keep the carryover audit, then approve."""
+    _carryover_watch(command, command_cwd, phase=phase, inspect_local_scripts=inspect_local_scripts)
     return _approved()
+
+
+def audit_replay_carryover(command: str, command_cwd: str | None = None, *,
+                           inspect_local_scripts: bool = True) -> list[tuple[str, str, str]]:
+    """Owner-confirmed (``force``) replay path: audit the carryover, NEVER re-block.
+
+    The replay is the user's own approval, so the verdict is preserved — but a pending request
+    later approved and replayed can carry a previously denied value into execution, and that must
+    leave an ``admitted`` row (phase ``replay``) instead of being silent.
+    """
+    return _carryover_watch(command, command_cwd, phase=PHASE_REPLAY,
+                            inspect_local_scripts=inspect_local_scripts)
 
 # --- Gateway approval queue (the blocking wait loop lives in approval_gateway_wait) ---------------------------------
 
@@ -659,16 +689,22 @@ def _gateway_notify_cb(session_key: str):
 
 def _pending_result(spec, session_key: str, *, command: str, description: str,
                     pattern_key: str, pattern_keys: list[str], body: str | None,
-                    smart_denied: bool) -> dict:
+                    smart_denied: bool, degraded: bool = False) -> dict:
     """Queue an approval nobody can answer right now (no gateway notifier, no CLI panel) for
     ``/approve`` / ``/deny`` review. Command/code gates return the backward-compatible
-    ``pending_approval`` shape (``pattern_keys`` + STOP text); the action gate ``approval_required``."""
-    pending = {"command": command, "pattern_key": pattern_key}
+    ``pending_approval`` shape (``pattern_keys`` + STOP text); the action gate ``approval_required``.
+
+    ``degraded`` marks a request raised because the scanner was unavailable: neither scope may be
+    offered (the only sanctioned acknowledgement is the recorded operator opt-in) and the payload
+    carries the marker so the reviewing surface can say so."""
+    pending: dict = {"command": command, "pattern_key": pattern_key}
     if spec.pending_keys:
         pending["pattern_keys"] = pattern_keys
     pending["description"] = description
     if smart_denied:
         pending.update(smart_denied=True, allow_permanent=False)
+    if degraded:
+        pending.update(degradation=True, allow_permanent=False, allow_session=False)
     submit_pending(session_key, pending)
     if not spec.pending_keys:
         return {
@@ -690,6 +726,8 @@ def _pending_result(spec, session_key: str, *, command: str, description: str,
     }
     if smart_denied:
         result.update(smart_denied=True, allow_permanent=False)
+    if degraded:
+        result.update(degradation=True, allow_permanent=False, allow_session=False)
     return result
 
 
@@ -748,7 +786,8 @@ def _unattended_contexts() -> list[_Unattended]:
     return contexts
 
 
-def _unattended_deny(command: str, ctx: _Unattended, command_cwd: str | None = None) -> dict | None:
+def _unattended_deny(command: str, ctx: _Unattended, command_cwd: str | None = None,
+                     *, inspect_local_scripts: bool = True) -> dict | None:
     """Deny-mode handling for one unattended context (cron / -q / webhook); None = allow.
 
     Pattern detection first, then tirith so content-level threats (homograph URLs,
@@ -756,6 +795,10 @@ def _unattended_deny(command: str, ctx: _Unattended, command_cwd: str | None = N
     An un-importable tirith honours ``security.tirith_fail_open``: fail-closed means block,
     since nobody can approve. Last, R2 value-tracking: a denied interpreter-hijack override
     re-appearing in the command or in an executed script's content is detected.
+
+    A degraded scan (scanner unavailable) is marked ``degradation`` and reported as such in the
+    block text; when the operator has acknowledged degraded operation the command proceeds but the
+    result still carries the degradation, so it is not silent at the command boundary.
     """
     if ctx.mode() != "deny":
         return None
@@ -778,27 +821,30 @@ def _unattended_deny(command: str, ctx: _Unattended, command_cwd: str | None = N
         from tools.tirith_security import check_command_security
         tirith = check_command_security(command)
     except ImportError:
-        if _tirith_fail_open():
-            return None
-        return {"approved": False, "message": (
-            "BLOCKED: the Tirith security scanner could not be imported and security.tirith_fail_open is false, "
-            f"so this command cannot be silently allowed — and {ctx.clause}. "
-            f"Find an alternative approach, install tirith, or set approvals.{ctx.cfg_key}: approve in config.yaml.")}
+        tirith = _unimportable_scanner_result(_tirith_fail_open())
+    degradation = tirith.get("degradation") or None
     if tirith.get("action") in ("block", "warn"):
         _remember_denied_env_override(command)  # no-op unless the command carries a tracked override
-        return block(_format_tirith_description(tirith))
+        return _with_degradation(block(_format_tirith_description(tirith)), degradation)
     # R2/R3: a denied env override re-appearing here (command text or executed-script content)
     # is DETECTED, not merely logged. Plain spellings only; token-splicing is declared non-coverage.
-    recurring = _reappearing_denied_overrides(command, command_cwd)
+    recurring = _reappearing_denied_overrides(command, command_cwd,
+                                              inspect_local_scripts=inspect_local_scripts)
     if recurring:
         var, value, source = recurring[0]
-        _record_guard_event("carryover", get_current_session_key(), var=var, value=value,
-                            outcome="blocked", command=command, source=source)
+        _record_guard_event(KIND_CARRYOVER, get_current_session_key(), var=var, value=value,
+                            outcome=OUTCOME_BLOCKED, command=command, source=source,
+                            phase=PHASE_APPROVAL)
+        # The command text is just `bash file.sh`, so the scripted carrier is recorded explicitly.
+        _remember_denied_env_override(command, carried=[e for e in recurring if e[2] != "command"])
         carried = (f", carried by executed script {source}" if source != "command" else "")
-        return block(
+        return _with_degradation(block(
             f"command carries an environment override denied earlier in this session: "
             f"{var}={value!r}{carried}"
-        )
+        ), degradation)
+    if degradation is not None:
+        # Scanner-less allow under an acknowledged degradation: still attributable at the boundary.
+        return {"approved": True, "message": None, "degradation": degradation}
     return None
 
 
@@ -925,7 +971,8 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
                     pattern_key: str, pattern_keys: list[str], warnings: list[tuple],
                     session_key: str, approval_callback, is_cli: bool, is_gateway: bool,
                     is_ask: bool, smart: bool = False,
-                    permanent_capable: bool = True, pending_body=None) -> dict:
+                    permanent_capable: bool = True, pending_body=None,
+                    degradation: dict | None = None) -> dict:
     """Ask a human (after the optional guardian-LLM step) and turn the answer into the gate result.
 
     ``warnings`` are the ``(key, _, is_tirith)`` tuples :func:`_persist_choice` stores on
@@ -933,17 +980,25 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
     allowlisted (pure-tirith prompts); a smart-DENY owner override reduces every surface to
     once/deny and persists nothing. ``pending_body`` is a thunk, built only once a human is
     actually asked, so a smart APPROVE never pays for redacting a large script.
+
+    ``degradation`` marks a request raised because the scanner was UNAVAILABLE — not an ordinary
+    threat finding. The command has not been scanned at all, so neither the guardian LLM nor a
+    recorded session/always grant may stand in for the operator's acknowledgement (the sanctioned
+    one is ``security.tirith_fail_open``): the guardian is skipped and every surface offers
+    once/deny only.
     """
     from agent.redact import redact_sensitive_text
 
     smart_denied = False
-    if smart:
+    degraded = degradation is not None
+    if smart and not degraded:
         result, smart_denied = _smart_gate(spec, command, description, pattern_key, pattern_keys,
                                            session_key, human_present=is_cli or is_gateway or is_ask)
         if result is not None:
             return result
     pending_body = pending_body() if pending_body else None
-    allow_permanent = permanent_capable and not smart_denied
+    once_only = smart_denied or degraded
+    allow_permanent = permanent_capable and not once_only
 
     def deny(template: str, outcome: str, **fmt) -> dict:
         breaker = ""
@@ -956,8 +1011,9 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
                        outcome=outcome, noun=spec.noun, **extra)
 
     def grant(choice: str) -> dict:
-        # A smart-DENY owner override is always one operation, even if an older client returns "session" or "always".
-        if not smart_denied:
+        # A smart-DENY owner override or a degraded-scan prompt is always one operation, even if an
+        # older client returns "session" or "always" — nothing may be persisted from it.
+        if not once_only:
             _persist_choice(session_key, choice, warnings)
         if spec.user_approved:
             return _user_approved(session_key, description)
@@ -967,7 +1023,7 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
         attempt = _present_with_selected_transport(
             command=command, description=description, pattern_key=pattern_key, pattern_keys=pattern_keys,
             session_key=session_key, surface="gateway" if (is_gateway or is_ask) else "cli",
-            allow_session=not smart_denied, allow_permanent=allow_permanent,
+            allow_session=not once_only, allow_permanent=allow_permanent,
         )
         choice, denied = _transport_choice(attempt, pattern_key=pattern_key, description=description)
         if denied is not None:
@@ -993,11 +1049,13 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
             data = {
                 "command": display_command, "pattern_key": pattern_key,
                 "pattern_keys": pattern_keys, "description": display_description,
-                "allow_permanent": permanent_capable and not smart_denied,
-                "allow_session": not smart_denied,
+                "allow_permanent": permanent_capable and not once_only,
+                "allow_session": not once_only,
             }
             if smart_denied:
                 data["smart_denied"] = True
+            if degraded:
+                data["degradation"] = degradation
             decision = _await_gateway_decision(session_key, notify_cb, data, surface="gateway")
             if decision.get("notify_failed"):
                 return _denied(spec.notify_failed, pattern_key=pattern_key,
@@ -1032,7 +1090,7 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
                 display_command, display_description = command, description
             return _pending_result(
                 spec, session_key, command=display_command, description=display_description, pattern_key=pattern_key,
-                pattern_keys=pattern_keys, body=pending_body, smart_denied=smart_denied,
+                pattern_keys=pattern_keys, body=pending_body, smart_denied=smart_denied, degraded=degraded,
             )
 
     # CLI interactive: single combined prompt, wrapped in the pre/post plugin hooks.
@@ -1044,7 +1102,8 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
                        pattern_keys=list(pattern_keys), session_key=session_key, surface="cli")
     approval_context._fire_approval_hook("pre_approval_request", **hook_kwargs)
     choice = prompt_dangerous_approval(prompt_command, prompt_description, allow_permanent=allow_permanent,
-                                       smart_denied=smart_denied, approval_callback=approval_callback)
+                                       smart_denied=smart_denied, approval_callback=approval_callback,
+                                       allow_session=not once_only)
     approval_context._fire_approval_hook("post_approval_response", **hook_kwargs, choice=choice)
     if choice == "timeout":
         return deny(spec.cli_timeout, "timeout")
@@ -1254,7 +1313,18 @@ def request_tool_approval(tool_name: str, reason: str, *, rule_key: str = "", ap
 # --- Combined pre-exec guard (tirith + dangerous command detection) -------------------------------------------------
 
 def _format_tirith_description(tirith_result: dict) -> str:
-    """Human-readable severity/title/description summary of tirith findings."""
+    """Human-readable severity/title/description summary of tirith findings.
+
+    A DEGRADED verdict is reported as such, up front: the command has not been scanned at all,
+    which is a different fact from "the scan found nothing".
+    """
+    degradation = tirith_result.get("degradation") or {}
+    degraded_prefix = ""
+    if degradation:
+        degraded_prefix = (f"Security scan DEGRADED — the scanner was unavailable "
+                           f"(reason: {degradation.get('reason', 'unknown')}), so this command has "
+                           f"NOT been scanned (acknowledgement source: "
+                           f"{degradation.get('acknowledgement_source', 'unknown')}). ")
     parts = []
     for f in tirith_result.get("findings") or []:
         severity, title, desc = f.get("severity", ""), f.get("title", ""), f.get("description", "")
@@ -1263,8 +1333,49 @@ def _format_tirith_description(tirith_result: dict) -> str:
             parts.append(f"[{severity}] {text}" if severity else text)
     if not parts:
         summary = tirith_result.get("summary") or "security issue detected"
-        return f"Security scan: {summary}"
-    return "Security scan — " + "; ".join(parts)
+        return f"{degraded_prefix}Security scan: {summary}"
+    return degraded_prefix + "Security scan — " + "; ".join(parts)
+
+
+def _tirith_degradation(reason: str, *, outcome: str, attempted_path: str = "",
+                        resolved_path: str = "", breaker_open: bool = False) -> dict:
+    """Structured record of a decision taken WITHOUT the scanner (see tools.tirith_security)."""
+    return {"reason": reason, "attempted_path": attempted_path, "resolved_path": resolved_path,
+            "breaker_open": breaker_open, "acknowledgement_source": tirith_fail_open_source(),
+            "outcome": outcome}
+
+
+def _emit_degradation_event(record: dict) -> None:
+    """One ledger row per degraded command (never a process-deduplicated warning)."""
+    _record_guard_event(KIND_DEGRADATION, get_current_session_key(), outcome=record["outcome"],
+                        extra={k: v for k, v in record.items() if k != "outcome"})
+
+
+def _unimportable_scanner_result(fail_open: bool) -> dict:
+    """Scanner module un-importable: still a degradation, still loud and attributable.
+
+    Mirrors ``tools.tirith_security``'s contract for every other unavailability — an allow with a
+    summary when the operator has acknowledged degraded operation, else a HIGH warn that goes
+    through the normal approval flow (#20733) — plus the ``degradation`` marker, so no later layer
+    can mistake it for an ordinary threat finding or auto-approve it.
+    """
+    # Duplicated literal by necessity: this path runs precisely when the module cannot be imported.
+    reason = "import_error"  # == tools.tirith_security.REASON_IMPORT_ERROR
+    record = _tirith_degradation(reason, outcome=OUTCOME_ALLOWED if fail_open else OUTCOME_BLOCKED,
+                                 attempted_path="tools.tirith_security")
+    _emit_degradation_event(record)
+    if fail_open:
+        return {"action": "allow", "findings": [], "summary": "Tirith unavailable (acknowledged)",
+                "degradation": record}
+    return {"action": "warn", "summary": "Tirith unavailable (fail-closed)", "degradation": record,
+            "findings": [{
+                "rule_id": "tirith-import-error", "severity": "HIGH",
+                "title": "Tirith security module unavailable",
+                "description": ("The Tirith security scanner could not be imported. "
+                                "Because security.tirith_fail_open is false, this "
+                                "command cannot be silently allowed. Approve only if "
+                                "you have verified the command is safe."),
+            }]}
 
 
 def _tirith_scan(command: str) -> dict:
@@ -1275,32 +1386,67 @@ def _tirith_scan(command: str) -> dict:
         from tools.tirith_security import check_command_security
         return check_command_security(command)
     except ImportError:
-        if _tirith_fail_open():
-            return {"action": "allow", "findings": [], "summary": ""}
-        return {"action": "warn", "summary": "Tirith unavailable (fail-closed)", "findings": [{
-            "rule_id": "tirith-import-error", "severity": "HIGH",
-            "title": "Tirith security module unavailable",
-            "description": ("The Tirith security scanner could not be imported. "
-                            "Because security.tirith_fail_open is false, this "
-                            "command cannot be silently allowed. Approve only if "
-                            "you have verified the command is safe."),
-        }]}
+        return _unimportable_scanner_result(_tirith_fail_open())
+
+
+def _command_runs_on_host(env_type: str, has_host_access: bool = False) -> bool:
+    """True when the command executes on THIS host's filesystem.
+
+    Only then does a script path in the command refer to the same file the guard can read and scan.
+    A remote backend (ssh / modal / daytona / vercel_sandbox) executes in ITS filesystem, so a
+    same-named local file is unrelated; a docker container is separated from host paths unless they
+    are bind-mounted AND the path maps identically, which is not knowable here — so the local-script
+    inspection is constrained to the local backend rather than assumed.
+    """
+    return env_type == "local"
+
+
+def _degradation_summary(degradation: dict) -> str:
+    """Compact human-readable form of a degradation record (for block messages)."""
+    return (f"security scan DEGRADED ({degradation.get('reason', 'unknown')}): the command was NOT "
+            f"scanned; acknowledgement source "
+            f"{degradation.get('acknowledgement_source', 'unknown')}")
+
+
+def _with_degradation(result: dict, degradation: dict | None) -> dict:
+    """Preserve a degraded-scanner record through the approval result (terminal result surface).
+
+    A BLOCKED decision additionally names the degradation in its message, because a block caused by
+    an unavailable scanner must not read like an ordinary threat finding to whatever consumes the
+    result. The reason is only appended when the message does not already carry it (the unattended
+    block text embeds the full finding description).
+    """
+    if not degradation:
+        return result
+    result["degradation"] = degradation
+    reason = str(degradation.get("reason", ""))
+    if not result.get("approved") and result.get("message") and reason not in result["message"]:
+        result["message"] = f"{result['message']} [{_degradation_summary(degradation)}]"
+    return result
 
 
 def check_all_command_guards(command: str, env_type: str,
                              approval_callback=None,
                              has_host_access: bool = False,
-                             command_cwd: str | None = None) -> dict:
+                             command_cwd: str | None = None,
+                             inspect_local_scripts: bool | None = None) -> dict:
     """Run all pre-exec security checks and return a single approval decision. Tirith and
     dangerous-command findings are presented as ONE combined approval request, so a gateway
     force=True replay cannot bypass one check when only the other was shown to the user.
     ``has_host_access``: a Docker sandbox with bind-mounted host paths takes the normal flow.
-    ``command_cwd``: the session cwd the command runs in, so R2 script-content tracking can
-    resolve relative script paths (best-effort; opaque paths simply are not scanned)."""
+    ``command_cwd``: the EFFECTIVE cwd the command runs in (the same value the execution is given,
+    resolved once by the caller), so R2 script-content tracking resolves the same file the command
+    will execute (best-effort; opaque paths simply are not scanned).
+    ``inspect_local_scripts``: whether reading local script files is meaningful for this backend
+    (default: only on the local backend — see :func:`_command_runs_on_host`).
+    """
+    if inspect_local_scripts is None:
+        inspect_local_scripts = _command_runs_on_host(env_type, has_host_access)
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
         if (blocked := _user_deny_block(command)) is not None:
             return blocked
-        return _approved_with_carryover_watch(command, command_cwd)
+        return _approved_with_carryover_watch(command, command_cwd,
+                                              inspect_local_scripts=inspect_local_scripts)
 
     blocked = _floor_block(command, sudo_guard=True)
     if blocked is not None:
@@ -1313,29 +1459,44 @@ def check_all_command_guards(command: str, env_type: str,
 
     approval_mode = approval_context._get_approval_mode()
     if _yolo_active() or approval_mode == "off":
-        return _approved_with_carryover_watch(command, command_cwd)
+        return _approved_with_carryover_watch(command, command_cwd,
+                                             inspect_local_scripts=inspect_local_scripts)
     if _command_matches_permanent_allowlist(command):
-        return _approved_with_carryover_watch(command, command_cwd)
+        return _approved_with_carryover_watch(command, command_cwd,
+                                             inspect_local_scripts=inspect_local_scripts)
 
     approval_callback, is_cli, is_gateway, is_ask = _presence(approval_callback)
     # Outside CLI/gateway/ask flows we never block on approvals: each
     # unattended context applies its configured deny/approve mode, else allow.
     if not is_cli and not is_gateway and not is_ask:
         for ctx in _unattended_contexts():
-            result = _unattended_deny(command, ctx, command_cwd)
-            if result is not None:
-                return result
-        return _approved_with_carryover_watch(command, command_cwd)
+            result = _unattended_deny(command, ctx, command_cwd,
+                                      inspect_local_scripts=inspect_local_scripts)
+            if result is None:
+                continue
+            if result.get("approved"):
+                # Scanner-less allow under an acknowledged degradation: keep the carryover audit
+                # and preserve the degradation record through the result.
+                merged = _approved_with_carryover_watch(
+                    command, command_cwd, inspect_local_scripts=inspect_local_scripts)
+                return _with_degradation(merged, result.get("degradation"))
+            return result
+        return _approved_with_carryover_watch(command, command_cwd,
+                                             inspect_local_scripts=inspect_local_scripts)
 
     # Gather findings: warnings = [(pattern_key, description, is_tirith)]. Tirith block AND warn both go through the
     # approval flow (block used to be a hard stop) so users can inspect the findings and approve.
     tirith_result = _tirith_scan(command)
+    degradation = tirith_result.get("degradation") or None
     is_dangerous, pattern_key, description = detect_dangerous_command(command)
     warnings = []
     session_key = get_current_session_key()
     if tirith_result["action"] in {"block", "warn"}:
         findings = tirith_result.get("findings") or []
-        rule_id = findings[0].get("rule_id", "unknown") if findings else "unknown"
+        # A degraded scan is keyed by REASON and never shares a key with a threat finding: an
+        # approval persisted for one must not silently cover the other.
+        rule_id = (f"degradation:{degradation.get('reason', 'unknown')}" if degradation
+                   else (findings[0].get("rule_id", "unknown") if findings else "unknown"))
         tirith_key = f"tirith:{rule_id}"
         if not is_approved(session_key, tirith_key):
             warnings.append((tirith_key, _format_tirith_description(tirith_result), True))
@@ -1343,7 +1504,8 @@ def check_all_command_guards(command: str, env_type: str,
         warnings.append((pattern_key, description, False))
     # R2/R3: a denied env override re-appearing here (command text or executed-script content)
     # goes through the normal approval flow as a value-tracked finding.
-    recurring = _reappearing_denied_overrides(command, command_cwd)
+    recurring = _reappearing_denied_overrides(command, command_cwd,
+                                              inspect_local_scripts=inspect_local_scripts)
     if recurring:
         var, value, source = recurring[0]
         warnings.append((ENV_OVERRIDE_CARRYOVER_KEY,
@@ -1352,7 +1514,7 @@ def check_all_command_guards(command: str, env_type: str,
                           + (f" (in executed script {source})" if source != "command" else "")),
                          False))
     if not warnings:
-        return _approved()
+        return _with_degradation(_approved(), degradation)
 
     combined_desc = "; ".join(desc for _, desc, _ in warnings)
     primary_key = warnings[0][0]
@@ -1367,17 +1529,21 @@ def check_all_command_guards(command: str, env_type: str,
         session_key=session_key, approval_callback=approval_callback,
         is_cli=is_cli, is_gateway=is_gateway, is_ask=is_ask, smart=approval_mode == "smart",
         permanent_capable=any(not is_t for _, _, is_t in warnings),
+        degradation=degradation,
     )
     if not result.get("approved"):
         # A denial does not need the env rule to be the blocking one: the VALUE carried
         # by the denied command is what gets tracked (extraction no-ops without a value).
-        _remember_denied_env_override(command)
-        return result
+        # A SCRIPTED carryover is recorded too — the command text is only `bash file.sh`, so
+        # otherwise an interactive rejection of known-carried code would leave no trace.
+        _remember_denied_env_override(command, carried=[e for e in recurring if e[2] != "command"])
+        return _with_degradation(result, degradation)
     if recurring:
         var, value, source = recurring[0]
-        _record_guard_event("carryover", session_key, var=var, value=value,
-                            outcome="admitted", command=command, source=source)
-    return result
+        _record_guard_event(KIND_CARRYOVER, session_key, var=var, value=value,
+                            outcome=OUTCOME_ADMITTED, command=command, source=source,
+                            phase=PHASE_APPROVAL)
+    return _with_degradation(result, degradation)
 
 
 _EXECUTE_CODE_DESCRIPTION = (

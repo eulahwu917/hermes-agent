@@ -2617,13 +2617,28 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin, 
             return
         self._tirith_security_checked = True
         try:
-            from tools.tirith_security import ensure_installed, is_platform_supported
+            from tools.tirith_security import ensure_installed, is_platform_supported, _load_security_config
 
-            if (
-                ensure_installed(log_failures=False) is None and is_platform_supported()
-                and (self.config.get("security", {}) or {}).get("tirith_enabled", True)
-            ):
-                from tools.tirith_security import _load_security_config
+            _tirith_enabled = (self.config.get("security", {}) or {}).get("tirith_enabled", True)
+            if _tirith_enabled and not is_platform_supported():
+                # No tirith build exists for this platform, so the condition is PERMANENT: it must be
+                # visible BEFORE the first command instead of surfacing as a block. (Whether such a
+                # host fails closed by default is David's open decision — this banner states the
+                # behaviour that is actually configured, either way.)
+                _fail_open = _load_security_config().get("tirith_fail_open", False)
+                if _fail_open:
+                    _cprint(
+                        f"  {_DIM}⚠ tirith security scanner has no build for this platform — "
+                        f"pattern matching only (acknowledged via security.tirith_fail_open: true){_RST}"
+                    )
+                else:
+                    _cprint(
+                        f"  {_DIM}⚠ tirith security scanner has no build for this platform — terminal "
+                        f"commands will be BLOCKED (fail-closed). Acknowledge degraded "
+                        f"(pattern-matching-only) operation with security.tirith_fail_open: true, or set "
+                        f"security.tirith_enabled: false to disable scanning.{_RST}"
+                    )
+            elif ensure_installed(log_failures=False) is None and is_platform_supported() and _tirith_enabled:
                 _fail_open = _load_security_config().get("tirith_fail_open", False)
                 if _fail_open:
                     _cprint(

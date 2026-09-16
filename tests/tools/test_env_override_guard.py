@@ -5,13 +5,16 @@ value-following), and re-route events (R3 ledger). Token-spliced spellings are D
 NON-COVERAGE and asserted untracked (the card forbids chasing them with patterns)."""
 
 import json
+import os
 import time
+from unittest.mock import patch
 
 import pytest
 
 import tools.approval as approval_module
 from gateway.session_context import reset_session_vars
 from tools.approval import _Unattended, _unattended_deny
+from tools.approval_context import reset_current_session_key, set_current_session_key
 from tools.approval_detection import (
     ENV_OVERRIDE_HIJACK_DESCRIPTION,
     _env_override_hijack_findings,
@@ -35,6 +38,15 @@ def _sq_ctx() -> _Unattended:
 
 @pytest.fixture(autouse=True)
 def _clear_state(monkeypatch):
+    """Isolate this module from AMBIENT session state.
+
+    ``get_current_session_key()`` prefers the approval ContextVar over ``HERMES_SESSION_KEY``, so
+    pinning only the env var is not isolation: a neighbouring test module that binds the ContextVar
+    (and does not restore it) makes the guard record events under ITS session key, and the
+    assertions here read an empty store. Bind the intended session on this fixture's context and
+    restore the saved token in teardown.
+    """
+    session_token = set_current_session_key(SESSION)
     monkeypatch.setenv("HERMES_SESSION_KEY", SESSION)
     monkeypatch.delenv("HERMES_SINGLE_QUERY_SESSION", raising=False)
     monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
@@ -49,6 +61,7 @@ def _clear_state(monkeypatch):
     yield
     approval_module._denied_env_overrides.clear()
     reset_session_vars()
+    reset_current_session_key(session_token)
 
 
 def _seed_denied(var="PYTHONPATH", value=DENIED_VAL):
@@ -324,3 +337,312 @@ class TestFullGateIntegration:
         assert second["approved"] is False
         assert "denied earlier in this session" in second["message"]
         assert DENIED_VAL in second["message"] and str(script) in second["message"]
+
+
+# ---------------------------------------------------------------------------
+# F5 — parser precision AND coverage in the script heuristics (gate report 5400)
+# ---------------------------------------------------------------------------
+
+class TestScriptHeuristicPrecision:
+    """The heuristic must not invent carriers (non-executing syntax checks, literal heredoc data)
+    and must not miss ordinary shell forms (`;` separators, compound `set -eu; export …`)."""
+
+    def test_bash_n_syntax_only_is_not_execution(self, tmp_path):
+        script = tmp_path / "run.sh"
+        script.write_text(f"export PYTHONPATH={DENIED_VAL}\n", encoding="utf-8")
+        # `bash -n` PARSES only; real tirith 0.3.3 allows it (verified against the binary).
+        assert script_files_executed_by_command(f"bash -n {script}") == []
+        assert script_files_executed_by_command(f"sh --noexec {script}") == []
+        # …while the same file really executed is still located.
+        assert script_files_executed_by_command(f"bash {script}") == [str(script)]
+
+    def test_sh_e_with_file_is_still_located(self, tmp_path):
+        """`-e` is errexit, not inline code: `sh -e script.sh` runs the file."""
+        script = tmp_path / "run.sh"
+        script.write_text("echo hi\n", encoding="utf-8")
+        assert script_files_executed_by_command(f"sh -e {script}") == [str(script)]
+
+    def test_underscore_n_bundle_is_still_located(self, tmp_path):
+        """`--norc` is a long option that contains an `n` but does NOT disable execution."""
+        script = tmp_path / "run.sh"
+        script.write_text("echo hi\n", encoding="utf-8")
+        assert script_files_executed_by_command(f"bash --norc {script}") == [str(script)]
+
+    def test_heredoc_body_is_literal_data_not_assignments(self, tmp_path):
+        p = tmp_path / "doc.sh"
+        p.write_text("cat <<'EOF'\nexport PYTHONPATH=/documented\nEOF\necho done\n", encoding="utf-8")
+        assert extract_env_override_assignments_from_file(str(p)) == []
+
+    def test_piped_heredoc_body_is_literal_data(self, tmp_path):
+        p = tmp_path / "piped.sh"
+        p.write_text("cat <<EOF | tail -2\nexport PYTHONPATH=/piped\nEOF\n", encoding="utf-8")
+        assert extract_env_override_assignments_from_file(str(p)) == []
+
+    def test_heredoc_data_does_not_trip_carryover(self, tmp_path):
+        p = tmp_path / "doc.sh"
+        p.write_text(f"cat <<'EOF'\nexport PYTHONPATH={DENIED_VAL}\nEOF\n", encoding="utf-8")
+        _seed_denied()
+        assert approval_module._reappearing_denied_overrides(
+            "bash doc.sh", cwd=str(tmp_path)) == []
+
+    def test_file_semicolon_does_not_pollute_the_value(self, tmp_path):
+        p = tmp_path / "semi.sh"
+        p.write_text("export PYTHONPATH=/real;\n", encoding="utf-8")
+        assert extract_env_override_assignments_from_file(str(p)) == [("PYTHONPATH", "/real")]
+
+    def test_file_compound_segment_assignment_found(self, tmp_path):
+        p = tmp_path / "compound.sh"
+        p.write_text("set -eu; export PYTHONPATH=/real\necho hi\n", encoding="utf-8")
+        assert extract_env_override_assignments_from_file(str(p)) == [("PYTHONPATH", "/real")]
+
+    def test_file_executed_value_is_detected_and_blocked(self, tmp_path):
+        """The positive control: a plain semicolon form carrying a denied value IS caught."""
+        p = tmp_path / "carry.sh"
+        p.write_text(f"set -eu; export PYTHONPATH={DENIED_VAL}\n", encoding="utf-8")
+        _seed_denied()
+        recurring = approval_module._reappearing_denied_overrides("bash carry.sh", cwd=str(tmp_path))
+        assert recurring == [("PYTHONPATH", DENIED_VAL, str(p))]
+
+    def test_documented_variables_are_not_read_as_executed(self, tmp_path):
+        """A doc line that MENTIONS the construct inside a quoted string is not an assignment."""
+        p = tmp_path / "notes.sh"
+        p.write_text('echo "PYTHONPATH=/decoy"\necho PYTHONPATH=/decoy\n', encoding="utf-8")
+        assert extract_env_override_assignments_from_file(str(p)) == []
+
+
+# ---------------------------------------------------------------------------
+# F6 — the guard must inspect the file the command actually executes
+# ---------------------------------------------------------------------------
+
+class TestEffectiveCommandCwd:
+    """Gate report 5400 F6: only the SESSION cwd reached the guard while the tool's ``workdir`` is
+    per-command, so ``bash run.sh`` could scan A/run.sh and execute B/run.sh. The effective cwd must
+    be resolved ONCE and given to both the guard and the execution."""
+
+    @staticmethod
+    def _patch_entry_point(monkeypatch, plan_cwd, captured):
+        import tools.terminal_tool as tt
+        plan = tt._ExecPlan(
+            config={}, env_type="local", effective_task_id="t", image="",
+            cwd=plan_cwd, host_cwd=None, effective_timeout=10,
+        )
+        monkeypatch.setattr(tt, "_plan_execution", lambda *a, **k: plan)
+        monkeypatch.setattr(tt, "_acquire_env", lambda *a, **k: object())
+        monkeypatch.setattr(tt, "_pre_exec_block", lambda *a, **k: None)
+
+        def _guard(command, env_type, has_host_access=False, command_cwd=None):
+            captured["guard_cwd"] = command_cwd
+            return {"approved": True}
+
+        monkeypatch.setattr(tt, "_check_all_guards", _guard)
+
+        def _foreground(*a, **k):
+            captured["exec_cwd"] = k.get("command_cwd")
+            return "{}"
+
+        monkeypatch.setattr(tt, "_run_foreground", _foreground)
+        return tt
+
+    def test_per_call_workdir_is_the_file_the_guard_scans(self, monkeypatch, tmp_path):
+        captured = {}
+        a, b = tmp_path / "a", tmp_path / "b"
+        a.mkdir(), b.mkdir()
+        tt = self._patch_entry_point(monkeypatch, str(a), captured)
+        tt.clear_session_cwd(SESSION)
+        tt.record_session_cwd(SESSION, str(a))
+        tt.terminal_tool("bash run.sh", workdir=str(b))
+        assert captured["guard_cwd"] == str(b)
+        assert captured["exec_cwd"] == captured["guard_cwd"] == str(b)
+
+    def test_session_cwd_is_used_when_no_workdir(self, monkeypatch, tmp_path):
+        captured = {}
+        default, recorded = tmp_path / "default", tmp_path / "recorded"
+        default.mkdir(), recorded.mkdir()
+        tt = self._patch_entry_point(monkeypatch, str(default), captured)
+        tt.clear_session_cwd(SESSION)
+        tt.record_session_cwd(SESSION, str(recorded))
+        tt.terminal_tool("bash run.sh")
+        assert captured["guard_cwd"] == str(recorded) == captured["exec_cwd"]
+
+    def test_no_session_record_falls_back_to_the_planned_cwd(self, monkeypatch, tmp_path):
+        captured = {}
+        config_cwd = tmp_path / "config-cwd"
+        config_cwd.mkdir()
+        tt = self._patch_entry_point(monkeypatch, str(config_cwd), captured)
+        tt.clear_session_cwd(SESSION)
+        tt.terminal_tool("bash run.sh")
+        assert captured["guard_cwd"] == str(config_cwd) == captured["exec_cwd"]
+
+    def test_remote_backend_does_not_read_a_same_named_local_file(self, tmp_path, monkeypatch):
+        """A remote backend executes ITS `run.sh`; reading the local file of that name would block
+        (or miss) on an unrelated carrier."""
+        script = tmp_path / "carry.sh"
+        script.write_text(f"export PYTHONPATH={DENIED_VAL}\n", encoding="utf-8")
+        _seed_denied()
+        monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
+        remote = approval_module.check_all_command_guards(
+            "bash carry.sh", "ssh", command_cwd=str(tmp_path))
+        assert remote.get("approved") is True          # local file NOT inspected for a remote run
+        local = approval_module.check_all_command_guards(
+            "bash carry.sh", "local", command_cwd=str(tmp_path))
+        assert local["approved"] is False              # the local backend still inspects it
+
+
+# ---------------------------------------------------------------------------
+# F3/F4 — a degraded scanner is never auto-approved, always attributed
+# ---------------------------------------------------------------------------
+
+def _degradation_block(reason="spawn_failed", action="block"):
+    return {"action": action, "findings": [], "summary": "tirith unavailable",
+            "degradation": {"reason": reason, "attempted_path": "tirith", "resolved_path": "",
+                            "breaker_open": False,
+                            "acknowledgement_source": "config:security.tirith_fail_open",
+                            "outcome": "blocked" if action == "block" else "allowed"}}
+
+
+class TestDegradedScanConsent:
+    """Gate report 5400 F3: with ``approvals.mode: smart`` an unavailable scanner's block became an
+    ordinary approval warning and the AUXILIARY POLICY could approve it with no human at all."""
+
+    @pytest.fixture(autouse=True)
+    def _smart_mode(self, monkeypatch):
+        import hermes_cli.config as config_mod
+        monkeypatch.setattr(config_mod, "load_config_readonly",
+                            lambda: {"approvals": {"mode": "smart"}})
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        monkeypatch.delenv("HERMES_SINGLE_QUERY_SESSION", raising=False)
+
+    def test_guardian_cannot_approve_a_degraded_scan(self, monkeypatch, tmp_path):
+        import tools.tirith_security as tirith_mod
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(tirith_mod, "check_command_security", lambda command: _degradation_block())
+        calls = []
+        monkeypatch.setattr(approval_module, "_smart_verdict",
+                            lambda *a, **k: calls.append(a) or "approve")
+        asked = []
+
+        def cb(command, description, **kw):
+            asked.append(description)
+            return "once"          # the human approved the degraded command for this one run
+
+        result = approval_module.check_all_command_guards("echo hi", "local", approval_callback=cb)
+        assert calls == []                                  # guardian LLM never consulted
+        assert result["approved"] is True                   # the HUMAN's answer carried
+        assert not result.get("smart_approved")
+        assert asked and "DEGRADED" in asked[0]             # and the human was told why
+        assert result["degradation"]["reason"] == "spawn_failed"
+
+    def test_guardian_approval_never_reaches_a_degraded_scan(self, monkeypatch, tmp_path):
+        """The same control flow with NO callback available: the auxiliary APPROVE cannot stand in."""
+        import tools.tirith_security as tirith_mod
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(tirith_mod, "check_command_security", lambda command: _degradation_block())
+        monkeypatch.setattr(approval_module, "_smart_verdict", lambda *a, **k: "approve")
+        result = approval_module.check_all_command_guards("echo hi", "local")
+        assert result.get("approved") is not True
+        assert "DEGRADED" in (result.get("message") or result.get("description") or "")
+
+    def test_degraded_decision_is_never_persisted(self, monkeypatch, tmp_path):
+        """Neither [s]ession nor [a]lways may be recorded from a degraded prompt: the only sanctioned
+        acknowledgement is the operator's recorded opt-in."""
+        import tools.tirith_security as tirith_mod
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(tirith_mod, "check_command_security", lambda command: _degradation_block())
+        monkeypatch.setattr(approval_module, "_smart_verdict", lambda *a, **k: "approve")
+        seen_kwargs = {}
+
+        def cb(command, description, **kw):
+            seen_kwargs.update(kw)
+            return "session"
+
+        first = approval_module.check_all_command_guards("echo hi", "local", approval_callback=cb)
+        assert first["approved"] is True
+        assert seen_kwargs.get("allow_session") is False
+        assert seen_kwargs.get("allow_permanent") is False
+        assert approval_module.is_approved(SESSION, "tirith:degradation:spawn_failed") is False
+        assert approval_module.is_approved(SESSION, "tirith:degradation:spawn_failed") is False
+
+    def test_acknowledged_degradation_is_allowed_but_reported(self, monkeypatch, tmp_path):
+        """The fail-open (acknowledged) path stays allowed — and is still loud at the boundary."""
+        import tools.tirith_security as tirith_mod
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(tirith_mod, "check_command_security",
+                            lambda command: _degradation_block(action="allow"))
+        monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
+        result = approval_module.check_all_command_guards("echo hi", "local")
+        assert result["approved"] is True
+        assert result["degradation"]["outcome"] == "allowed"
+
+    def test_import_error_degradation_is_marked_and_loud(self, monkeypatch, tmp_path):
+        import sys
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
+        monkeypatch.delenv("TIRITH_FAIL_OPEN", raising=False)
+        with patch.dict(sys.modules, {"tools.tirith_security": None}):
+            result = approval_module.check_all_command_guards("echo hi", "local")
+        assert result["approved"] is False
+        assert result["degradation"]["reason"] == "import_error"
+        rows = [json.loads(line) for line in
+                (tmp_path / "security" / "guard_events.jsonl").read_text(encoding="utf-8").splitlines()]
+        assert [r["kind"] for r in rows] == ["degradation"]
+        assert rows[0]["reason"] == "import_error"
+
+    def test_unattended_execute_code_path_still_fails_closed_on_import_error(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
+        monkeypatch.delenv("TIRITH_FAIL_OPEN", raising=False)
+        import sys
+        with patch.dict(sys.modules, {"tools.tirith_security": None}):
+            result = approval_module.check_all_command_guards("echo hi", "local")
+        assert result["approved"] is False
+        assert "scan" in result["message"].lower()
+
+
+# ---------------------------------------------------------------------------
+# F8 — approved replay and rejected scripted carryover are audited
+# ---------------------------------------------------------------------------
+
+class TestCarryoverAuditCompleteness:
+    def test_owner_confirmed_replay_audits_the_carryover(self, tmp_path, monkeypatch):
+        """terminal_tool returned for internal ``force=True`` BEFORE the carryover watch, so an
+        approved/replayed gateway request could execute a carried value with no admitted-carryover
+        event."""
+        import tools.terminal_tool as tt
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        script = tmp_path / "carry.sh"
+        script.write_text(f"export PYTHONPATH={DENIED_VAL}\n", encoding="utf-8")
+        _seed_denied()
+        verdict = tt._run_approval_guards("bash carry.sh", "local", {}, force=True,
+                                          command_cwd=str(tmp_path))
+        assert verdict.approved_run is True          # the owner's approval is preserved
+        assert verdict.note and "denied earlier in this session" in verdict.note
+        rows = [json.loads(line) for line in
+                (tmp_path / "security" / "guard_events.jsonl").read_text(encoding="utf-8").splitlines()]
+        carry = [r for r in rows if r["kind"] == "carryover"]
+        assert len(carry) == 1
+        assert carry[0]["outcome"] == "admitted"
+        assert carry[0]["phase"] == "replay"         # distinct from the first-pass approval phase
+        assert carry[0]["source"] == str(script)
+
+    def test_rejected_scripted_carryover_records_a_denied_row(self, tmp_path, monkeypatch):
+        """Interactive rejection of a carried SCRIPT recorded nothing: the command is just
+        `bash file.sh`, so the extractor saw no override."""
+        import hermes_cli.config as config_mod
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(config_mod, "load_config_readonly", lambda: {"approvals": {}})
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+        monkeypatch.delenv("HERMES_SINGLE_QUERY_SESSION", raising=False)
+        script = tmp_path / "carry.sh"
+        script.write_text(f"export PYTHONPATH={DENIED_VAL}\n", encoding="utf-8")
+        _seed_denied()
+
+        result = approval_module.check_all_command_guards(
+            "bash carry.sh", "local", approval_callback=lambda c, d, **kw: "deny",
+            command_cwd=str(tmp_path))
+        assert result["approved"] is False
+        rows = [json.loads(line) for line in
+                (tmp_path / "security" / "guard_events.jsonl").read_text(encoding="utf-8").splitlines()]
+        assert [r["kind"] for r in rows] == ["denied"]
+        assert rows[0]["outcome"] == "blocked"
+        assert rows[0]["source"] == str(script)
+        assert rows[0]["value"] == DENIED_VAL

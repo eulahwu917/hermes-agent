@@ -143,11 +143,12 @@ def spawn_background_process(
     session_key: str, workdir: Optional[str], cwd: str, effective_pty: bool,
     notify_on_complete: bool, watch_patterns: Optional[List[str]], approval_note: Optional[str],
     completion_output_chars: int = 0,
-    pty_disabled_reason: Optional[str],
+    pty_disabled_reason: Optional[str], resolved_cwd: Optional[str] = None,
 ) -> str:
     """Spawn *command* as a tracked background process and return the JSON result.
 
-    Never inline-polls ``is_interrupted()``: the spawn detaches and returns
+    ``resolved_cwd`` is the effective cwd resolved ONCE by the caller (the same value the pre-exec
+    guard inspected). Never inline-polls ``is_interrupted()``: the spawn detaches and returns
     exit_code 0 immediately, so the stale-interrupt kill cannot occur here.
     """
     from tools.process_registry import process_registry
@@ -155,7 +156,7 @@ def spawn_background_process(
         _redact_terminal_error_text, _resolve_command_cwd, _resolve_notification_flag_conflict,
     )
 
-    effective_cwd = _resolve_command_cwd(
+    effective_cwd = resolved_cwd or _resolve_command_cwd(
         workdir=workdir, default_cwd=cwd, session_key=session_key, env_type=env_type,
     )
     try:

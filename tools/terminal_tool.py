@@ -145,15 +145,21 @@ def _docker_has_host_access(config: Dict[str, Any]) -> bool:
 
 
 def _check_all_guards(command: str, env_type: str,
-                      has_host_access: bool = False) -> dict:
+                      has_host_access: bool = False,
+                      command_cwd: Optional[str] = None) -> dict:
     """Delegate to consolidated guard (tirith + dangerous cmd) with CLI callback.
 
-    Also threads the session's recorded cwd so the guard's value-tracking layer can resolve
-    relative script paths executed by the command (best-effort; absent records leave it None)."""
+    ``command_cwd`` is the EFFECTIVE cwd the command will execute in, resolved ONCE by the caller
+    with the same resolver the execution uses — so the guard's value-tracking layer inspects the
+    very file the command runs. Resolving it separately (as before) let ``session cwd A`` + per-call
+    ``workdir B`` scan A/run.sh while executing B/run.sh. When it is None (direct callers), fall
+    back to the session's recorded cwd."""
+    if command_cwd is None:
+        command_cwd = get_session_cwd(_current_session_key() or None)
     return _check_all_guards_impl(command, env_type,
                                   approval_callback=_get_approval_callback(),
                                   has_host_access=has_host_access,
-                                  command_cwd=get_session_cwd(_current_session_key() or None))
+                                  command_cwd=command_cwd)
 
 
 from tools.environments.base import EnvironmentConnectionError
@@ -902,20 +908,56 @@ class _ApprovalVerdict:
     when the user explicitly approved (or pre-confirmed via ``force``); it drives
     the clean-interrupt-slate clear before ``env.execute`` so an approved command
     can't be SIGINT-killed by a bit that landed during the approval-wait.
+    ``degraded`` carries the structured degraded-scanner record when the decision was made
+    without the scanner, so the audit surface keeps it (see tools.guard_events).
     """
     note: Optional[str] = None
     approved_run: bool = False
+    degraded: Optional[dict] = None
 
 
-def _run_approval_guards(command: str, env_type: str, config: Dict[str, Any], *, force: bool) -> _ApprovalVerdict:
-    """Run tirith + dangerous-command guards; ``force`` skips them entirely.
+def _degradation_note(degradation: Optional[dict]) -> Optional[str]:
+    """One-line audit note for a decision taken without the scanner."""
+    if not degradation:
+        return None
+    return ("Security scan DEGRADED: the scanner was unavailable "
+            f"({degradation.get('reason', 'unknown')}), so this command was NOT scanned. "
+            f"Acknowledgement source: {degradation.get('acknowledgement_source', 'unknown')}.")
+
+
+def _join_notes(*notes: Optional[str]) -> Optional[str]:
+    joined = " ".join(n for n in notes if n)
+    return joined or None
+
+
+def _run_approval_guards(command: str, env_type: str, config: Dict[str, Any], *, force: bool,
+                         command_cwd: Optional[str] = None) -> _ApprovalVerdict:
+    """Run tirith + dangerous-command guards; ``force`` skips them entirely (the user already
+    confirmed this replay) but still AUDITS the carryover, because a pending request that is later
+    approved and replayed can carry a previously denied value into execution.
     Raises :class:`_Rejected` when the command may not run (denied, or pending
     gateway approval)."""
     if force:
-        return _ApprovalVerdict(approved_run=True)
-    approval = _check_all_guards(command, env_type, has_host_access=_docker_has_host_access(config))
+        from tools.approval import audit_replay_carryover
+        recurring = audit_replay_carryover(command, command_cwd,
+                                           inspect_local_scripts=env_type == "local")
+        note = None
+        if recurring:
+            var, value, source = recurring[0]
+            note = ("Owner-confirmed replay. NOTE: this command carries an environment override "
+                    f"denied earlier in this session ({var}, carried by "
+                    f"{'the command' if source == 'command' else source}); recorded on the guard "
+                    "ledger as an admitted carryover on replay.")
+        return _ApprovalVerdict(approved_run=True, note=note)
+    approval = _check_all_guards(command, env_type, has_host_access=_docker_has_host_access(config),
+                                 command_cwd=command_cwd)
+    degradation = approval.get("degradation") or None
+    degraded_note = _degradation_note(degradation)
     if not approval["approved"]:
         if approval.get("status") == "pending_approval":  # gateway ask mode
+            # Only carry the degradation key when there IS one, so a normal pending payload keeps
+            # its historical shape (no null field for consumers to misread).
+            pending_extra = {"degradation": degradation} if degradation else {}
             raise _Rejected(_error_json(
                 "", status="pending_approval",
                 approval_pending=True,
@@ -924,6 +966,7 @@ def _run_approval_guards(command: str, env_type: str, config: Dict[str, Any], *,
                 pattern_key=approval.get("pattern_key", ""),
                 smart_denied=approval.get("smart_denied", False),
                 allow_permanent=approval.get("allow_permanent", True),
+                **pending_extra,
             ))
         desc = approval.get("description", "command flagged")
         fallback_msg = (
@@ -935,12 +978,17 @@ def _run_approval_guards(command: str, env_type: str, config: Dict[str, Any], *,
     desc = approval.get("description", "flagged as dangerous")
     if approval.get("user_approved"):
         return _ApprovalVerdict(
-            note=f"Command required approval ({desc}) and was approved by the user.",
-            approved_run=True,
+            note=_join_notes(
+                f"Command required approval ({desc}) and was approved by the user.", degraded_note),
+            approved_run=True, degraded=degradation,
         )
     if approval.get("smart_approved"):
-        return _ApprovalVerdict(note=f"Command was flagged ({desc}) and auto-approved by smart approval.")
-    return _ApprovalVerdict()
+        return _ApprovalVerdict(
+            note=_join_notes(
+                f"Command was flagged ({desc}) and auto-approved by smart approval.", degraded_note),
+            degraded=degradation,
+        )
+    return _ApprovalVerdict(note=degraded_note, degraded=degradation)
 
 
 @dataclass
@@ -1131,10 +1179,19 @@ def _run_foreground(
     command: str, env: Any, plan: _ExecPlan, *,
     task_id: Optional[str], session_id: Optional[str], session_key: str,
     workdir: Optional[str], approval_note: Optional[str], clear_interrupt: bool,
+    command_cwd: Optional[str] = None,
 ) -> str:
-    """Execute in the foreground with retry on transient errors, then finalize."""
+    """Execute in the foreground with retry on transient errors, then finalize.
+
+    ``command_cwd`` is the effective cwd resolved ONCE by the caller (the same value the pre-exec
+    guard inspected); when omitted, resolve it here with the same resolver.
+    """
     max_retries = 3
     env_type, eff, effective_timeout = plan.env_type, plan.effective_task_id, plan.effective_timeout
+    if command_cwd is None:
+        command_cwd = _resolve_command_cwd(
+            workdir=workdir, default_cwd=plan.cwd, session_key=session_key, env_type=env_type,
+        )
 
     # Clean interrupt slate for an approved command, ONCE before the retry
     # loop: drop a stale bit that landed during the approval-wait so it
@@ -1147,9 +1204,6 @@ def _run_foreground(
 
     for retry_count in range(max_retries + 1):
         try:
-            command_cwd = _resolve_command_cwd(
-                workdir=workdir, default_cwd=plan.cwd, session_key=session_key, env_type=env_type,
-            )
             # bounded_capture: model-facing output keeps a head/tail window
             # while streaming so a verbose command can't OOM the gateway;
             # internal env.execute() consumers stay unbounded.
@@ -1321,9 +1375,15 @@ def terminal_tool(
                 "(process-identity probe wedged); the command was not run. Retry the call.",
                 status="error",
             ))
+        # Resolve the effective cwd ONCE, with the SAME resolver the execution uses, and hand that
+        # one value to both the guard and the execution: the guard must inspect the file the command
+        # actually runs (session cwd A + per-call workdir B used to scan A/run.sh while running B/run.sh).
+        command_cwd = _resolve_command_cwd(workdir=workdir, default_cwd=cwd,
+                                          session_key=session_key, env_type=env_type)
         # Pre-exec security checks (tirith + dangerous command detection);
-        # force=True means the user already confirmed.
-        verdict = _run_approval_guards(command, env_type, plan.config, force=force)
+        # force=True means the user already confirmed (the replay is still audited).
+        verdict = _run_approval_guards(command, env_type, plan.config, force=force,
+                                       command_cwd=command_cwd)
 
         pty_disabled = pty and _command_requires_pipe_stdin(command)
         if plan.promoted_from_foreground_timeout is not None:
@@ -1334,6 +1394,7 @@ def terminal_tool(
             result = spawn_background_process(
                 command=command, env=env, env_type=env_type, effective_task_id=effective_task_id,
                 task_id=task_id, session_key=session_key, workdir=workdir, cwd=cwd,
+                resolved_cwd=command_cwd,
                 effective_pty=pty and not pty_disabled, notify_on_complete=notify_on_complete,
                 watch_patterns=watch_patterns, approval_note=verdict.note,
                 pty_disabled_reason=_PTY_DISABLED_REASON if pty_disabled else None,
@@ -1346,6 +1407,7 @@ def terminal_tool(
             command, env, plan,
             task_id=task_id, session_id=session_id, session_key=session_key,
             workdir=workdir, approval_note=verdict.note, clear_interrupt=verdict.approved_run,
+            command_cwd=command_cwd,
         )
     except _Rejected as r:
         return r.result_json

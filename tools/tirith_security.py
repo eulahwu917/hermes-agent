@@ -5,7 +5,18 @@ enriches findings. Operational failures and any form of scanner unavailability (
 unknown exit, circuit breaker, no platform build) follow ``security.tirith_fail_open``,
 which DEFAULTS TO FAIL-CLOSED: the command is blocked with a clear reason instead of
 silently proceeding with pattern matching only. Setting ``tirith_fail_open: true`` is the
-operator's explicit, recorded (config.yaml) acknowledgement of degraded operation.
+operator's explicit, recorded acknowledgement of degraded operation (the ``TIRITH_FAIL_OPEN``
+env var overrides it, and the source that actually took effect is recorded on every degraded
+decision).
+
+A degraded decision is never silent and never mistakable for an ordinary threat finding: the
+verdict carries a structured ``degradation`` record and each affected command appends a
+``degradation`` row (reason, attempted/resolved path, breaker state, session/profile,
+acknowledgement source, outcome) to the shared guard event ledger (``tools.guard_events``).
+
+The circuit breaker is per Hermes home and recovers without a process restart: a bounded re-probe
+re-runs resolution + spawn (one attempt per ``_BREAKER_REPROBE_INTERVAL_S``), a successful scan or a
+resolved binary closes it, and :func:`reset_circuit_breaker` is the explicit supported reset.
 Programming errors propagate. Auto-install: a missing tirith is downloaded from
 GitHub releases to $HERMES_HOME/bin/tirith in a background thread -- SHA-256 always verified,
 cosign provenance when cosign is on PATH."""
@@ -26,6 +37,9 @@ import urllib.request
 from contextlib import suppress
 
 from hermes_constants import get_hermes_home, get_hermes_home_override, hermes_home_key
+from tools.guard_events import (
+    KIND_DEGRADATION, OUTCOME_ALLOWED, OUTCOME_BLOCKED, record_guard_event,
+)
 
 logger = logging.getLogger(__name__)
 _REPO = "sheeki03/tirith"
@@ -70,22 +84,30 @@ _install_failure_reason: str = ""  # reason tag when _resolved_path is _INSTALL_
 # ``<home>/bin/tirith`` are per profile, so the launch profile's slot above must not answer for them.
 _resolved_path_by_home: dict[str, str] = {}
 
-# Circuit breaker: after _CRASH_LIMIT consecutive spawn/execution failures tirith is disabled so a broken
-# binary can't turn every tool call into a fail-open retry loop (#41400). The breaker HALF-OPENS after
-# _CIRCUIT_RETRY_S: one caller re-probes tirith for real, and any completed scan (exit 0/1/2 — allow/block/warn
-# all prove the binary is healthy) closes it, while a failed probe re-arms the timer. Without the TTL this was
-# a one-way latch: once open, the reset branch below was unreachable for the rest of the process.
-# Thread safety: crash counting stays lock-free — a racing double-increment only opens the breaker one call
-# early, which is harmless, and matches the mcp_tool.py error counters rather than the locked _warn_once
-# pattern. _breaker_lock guards ONLY the half-open claim (TTL check + timestamp re-arm, nanoseconds); it is
-# never held across the subprocess probe, so it cannot reintroduce the #41400 hang. Claiming re-arms
-# _circuit_open_at first, so concurrent callers see a fresh TTL and stay fail-open: one probe per TTL window.
+# Circuit breaker: after _CRASH_LIMIT consecutive spawn/execution failures tirith is disabled
+# for the rest of the process so a broken binary can't turn every tool call into a fail-open
+# retry loop. The breaker RECOVERS without a restart: a bounded re-probe (one attempt per
+# _BREAKER_REPROBE_INTERVAL_S) re-runs resolution + spawn, a successful scan or a completed
+# resolution clears it, and reset_circuit_breaker() is the explicit supported reset. Failure is
+# counted per Hermes home so one routed profile's broken binary cannot stop scanning for every
+# other profile sharing the process. The counters stay lock-free (see the thread-safety note below).
+
 _CRASH_LIMIT = 3
 _CIRCUIT_RETRY_S = 300  # half-open probe interval (seconds)
 _crash_count: int = 0
 _circuit_open: bool = False
-_circuit_open_at: float = 0.0
+# Same state for routed multiplex profiles, keyed by Hermes home (see _breaker_scope): the default
+# home keeps using the module globals above so the historical surface is unchanged.
+_crash_count_by_home: dict[str, int] = {}
+_circuit_open_by_home: dict[str, bool] = {}
+_breaker_opened_at: float = 0.0        # monotonic ts the default-scope breaker opened (0 = unknown)
+_breaker_opened_at_by_home: dict[str, float] = {}
+_last_reprobe_at: float = 0.0          # monotonic ts of the last bounded re-probe attempt
 _breaker_lock = threading.Lock()
+# One re-probe per interval: bounded (a hot loop cannot hammer a broken binary) and enough for a
+# restored scanner to be picked up automatically.
+_BREAKER_REPROBE_INTERVAL_S = 60.0
+
 
 _install_lock = threading.Lock()
 _install_thread: threading.Thread | None = None
@@ -98,13 +120,98 @@ _warned_lock = threading.Lock()
 _MARKER_TTL = 86400  # disk failure marker validity (24h) -- avoids retry across restarts
 
 
+def _breaker_scope() -> str:
+    """Hermes home this call belongs to (``""`` = the process-global default scope).
+
+    A routed multiplex profile resolves its own binary, so it owns its own breaker: one profile's
+    broken scanner must not stop scanning for a sibling profile sharing the process.
+    """
+    return hermes_home_key() if get_hermes_home_override() is not None else ""
+
+
+def _breaker_open() -> bool:
+    scope = _breaker_scope()
+    if scope:
+        return bool(_circuit_open_by_home.get(scope))
+    return _circuit_open
+
+
 def _record_tirith_crash() -> None:
-    global _crash_count, _circuit_open, _circuit_open_at
-    _crash_count += 1
-    if _crash_count >= _CRASH_LIMIT:
-        _circuit_open, _circuit_open_at = True, time.monotonic()
-        logger.warning("tirith circuit breaker opened after %d consecutive failures; "
-                       "disabling for %ds", _crash_count, _CIRCUIT_RETRY_S)
+    """Count one consecutive scanner failure and open this scope's breaker at the limit."""
+    global _crash_count, _circuit_open, _breaker_opened_at
+    scope = _breaker_scope()
+    if scope:
+        count = _crash_count_by_home.get(scope, 0) + 1
+        _crash_count_by_home[scope] = count
+        just_opened = count == _CRASH_LIMIT
+        if count >= _CRASH_LIMIT:
+            _circuit_open_by_home[scope] = True
+            _breaker_opened_at_by_home.setdefault(scope, time.monotonic())
+    else:
+        _crash_count += 1
+        just_opened = _crash_count == _CRASH_LIMIT
+        if _crash_count >= _CRASH_LIMIT:
+            _circuit_open = True
+            if not _breaker_opened_at:
+                _breaker_opened_at = time.monotonic()
+    if just_opened:
+        logger.warning("tirith circuit breaker opened after %d consecutive failures; scanning "
+                       "unavailable until the scanner is restored (bounded automatic re-probe "
+                       "every %ds)", _CRASH_LIMIT, int(_BREAKER_REPROBE_INTERVAL_S))
+
+
+def _reset_breaker() -> None:
+    """Close this scope's breaker and clear its failure count.
+
+    Called on a successful scan AND whenever resolution succeeds (a completed install, or a
+    manually restored binary), so restoring the scanner does resume scanning.
+    """
+    global _crash_count, _circuit_open, _breaker_opened_at, _last_reprobe_at
+    scope = _breaker_scope()
+    if scope:
+        _crash_count_by_home.pop(scope, None)
+        _circuit_open_by_home.pop(scope, None)
+        _breaker_opened_at_by_home.pop(scope, None)
+        return
+    _crash_count, _breaker_opened_at, _last_reprobe_at = 0, 0.0, 0.0
+    _circuit_open = False
+
+
+def reset_circuit_breaker() -> None:
+    """Explicit supported reset: close the breaker for EVERY scope and clear all counters.
+
+    The operator-facing recovery action (and the test seam). Restoring the scanner alone may not
+    be enough while a re-probe is still waiting out its interval.
+    """
+    global _crash_count, _circuit_open, _breaker_opened_at, _last_reprobe_at
+    _crash_count, _breaker_opened_at, _last_reprobe_at = 0, 0.0, 0.0
+    _circuit_open = False
+    _crash_count_by_home.clear()
+    _circuit_open_by_home.clear()
+    _breaker_opened_at_by_home.clear()
+
+
+def _breaker_reprobe_allowed() -> bool:
+    """True at most once per ``_BREAKER_REPROBE_INTERVAL_S``, process-wide.
+
+    The bounded recovery path: an open breaker still re-runs resolution + spawn occasionally, so a
+    scanner restored after the trip resumes scanning without a process restart. A breaker whose
+    open time was never recorded (legacy/test state) is NOT eligible — fail closed.
+    """
+    global _last_reprobe_at, _breaker_opened_at
+    scope = _breaker_scope()
+    opened_at = _breaker_opened_at_by_home.get(scope, 0.0) if scope else _breaker_opened_at
+    if not opened_at:
+        return False
+    with _breaker_lock:
+        now = time.monotonic()
+        if now - opened_at < _BREAKER_REPROBE_INTERVAL_S:
+            return False
+        if now - _last_reprobe_at < _BREAKER_REPROBE_INTERVAL_S:
+            return False
+        _last_reprobe_at = now
+        return True
+
 
 
 def _warn_once(key: str, message: str, *args) -> None:
@@ -135,6 +242,9 @@ def _set_resolved(path: str) -> None:
     global _install_failure_reason
     _store_resolved(path)
     _install_failure_reason = ""
+    # A resolved binary means the scanner is usable again: close this scope's breaker so a completed
+    # install (or a manually restored tirith) resumes scanning without waiting for a re-probe.
+    _reset_breaker()
 
 
 def _set_failed(reason: str) -> None:
@@ -504,76 +614,160 @@ def _verdict(action: str, summary: str = "", findings: list | None = None) -> di
     return {"action": action, "findings": [] if findings is None else findings, "summary": summary}
 
 
-def _fail(fail_open: bool, open_summary: str, closed_summary: str) -> dict:
-    return _verdict("allow", open_summary) if fail_open else _verdict("block", closed_summary)
+# Degradation reasons: WHY the scanner could not be used. Recorded structurally on EVERY affected
+# command, and the marker that distinguishes a degraded decision from an ordinary threat finding —
+# a degraded verdict has NOT scanned the command, so it must never be auto-approved by another
+# layer (see ``tools.approval``: the guardian LLM is skipped and the decision is never persisted).
+REASON_SPAWN_FAILED = "spawn_failed"
+REASON_TIMEOUT = "timeout"
+REASON_UNKNOWN_EXIT = "unknown_exit"
+REASON_CIRCUIT_BREAKER = "circuit_breaker"
+REASON_UNSUPPORTED_PLATFORM = "unsupported_platform"
+REASON_PATH_UNAVAILABLE = "path_unavailable"
+REASON_IMPORT_ERROR = "import_error"  # raised by the approval consumers when this module won't import
 
 
-def _crash(fail_open: bool, open_summary: str, closed_summary: str) -> dict:
+def _session_key_for_events() -> str:
+    try:
+        from tools.approval_context import get_current_session_key
+        return get_current_session_key(default="")
+    except Exception:
+        return ""
+
+
+def _acknowledgement_source() -> str:
+    """Where the fail-open acknowledgement actually lives (env var overrides config.yaml)."""
+    try:
+        from tools.approval_context import tirith_fail_open_source
+        return tirith_fail_open_source()
+    except Exception:
+        return "unknown"
+
+
+def _degraded(action: str, summary: str, *, reason: str, attempted_path: str = "",
+              resolved_path: str = "", breaker_open: bool = False,
+              findings: list | None = None) -> dict:
+    """A decision taken WITHOUT the scanner: loud and attributable at the command boundary.
+
+    Every affected command gets its OWN ledger row — not one process-deduplicated warning — carrying
+    the reason, the attempted/resolved scanner path, the breaker state, the session/profile, the
+    acknowledgement source and the outcome. The verdict also carries the same structured record so
+    the consumers can preserve it through the terminal result surface instead of discarding it.
+    """
+    verdict = _verdict(action, summary, findings)
+    record = {
+        "reason": reason,
+        "attempted_path": attempted_path,
+        "resolved_path": resolved_path,
+        "breaker_open": bool(breaker_open),
+        "acknowledgement_source": _acknowledgement_source(),
+        "outcome": OUTCOME_BLOCKED if action == "block" else OUTCOME_ALLOWED,
+    }
+    verdict["degradation"] = record
+    record_guard_event(KIND_DEGRADATION, _session_key_for_events(), outcome=record["outcome"],
+                       extra={k: v for k, v in record.items() if k != "outcome"})
+    return verdict
+
+
+def _fail(fail_open: bool, open_summary: str, closed_summary: str, *, reason: str,
+          attempted_path: str = "", resolved_path: str = "", breaker_open: bool = False) -> dict:
+    """Scanner unavailability: fail open (acknowledged) or closed (default) — never silent."""
+    action, summary = ("allow", open_summary) if fail_open else ("block", closed_summary)
+    return _degraded(action, summary, reason=reason, attempted_path=attempted_path,
+                     resolved_path=resolved_path, breaker_open=breaker_open)
+
+
+def _crash(fail_open: bool, open_summary: str, closed_summary: str, *, reason: str,
+           attempted_path: str = "", resolved_path: str = "") -> dict:
     """An operational failure: count it toward the circuit breaker, then fail open/closed."""
     _record_tirith_crash()
-    return _fail(fail_open, open_summary, closed_summary)
+    return _fail(fail_open, open_summary, closed_summary, reason=reason,
+                 attempted_path=attempted_path, resolved_path=resolved_path,
+                 breaker_open=_breaker_open())
 
 
 # Remediation tail for fail-closed blocks: the fix direction plus the recorded-acknowledgement
 # escape hatch (security.tirith_fail_open: true). Kept OUT of the verdict when failing open.
 _ACK_HINT = ("Restore the scanner (tirith auto-installs to $HERMES_HOME/bin/tirith), set "
              "security.tirith_enabled: false to disable scanning, or explicitly acknowledge "
-             "degraded (pattern-matching-only) operation with security.tirith_fail_open: true in config.yaml.")
+             "degraded (pattern-matching-only) operation with security.tirith_fail_open: true "
+             "(the TIRITH_FAIL_OPEN env var overrides it; the effective source is recorded on every "
+             "degraded decision).")
 
 
 def check_command_security(command: str) -> dict:
     """Run the tirith scan on a command -> ``{"action": allow|warn|block, "findings", "summary"}``.
     Exit code determines the action; JSON enriches. Every form of scanner unavailability honours
     ``security.tirith_fail_open`` — fail-CLOSED by default (no silent degradation to pattern matching).
+
+    An unavailable scanner adds a structured ``degradation`` record to the verdict and one ledger
+    event per affected command, so a degraded decision is never silent and never mistakable for an
+    ordinary threat finding.
     """
-    global _crash_count
+
 
     cfg = _load_security_config()
     fail_open = bool(cfg.get("tirith_fail_open", False))  # absent key == the fail-closed default
     if not cfg["tirith_enabled"]:
         return _verdict("allow")
-    # Circuit breaker: if tirith has crashed _CRASH_LIMIT times in a row, stop trying for the rest of the
-    # process. Without this, a corrupted or missing binary causes every tool call to hit the same spawn
-    # failure → agent retry loop, hanging the user for 20+ minutes (issue #41400). Fail-closed default:
-    # the open breaker now BLOCKS instead of silently allowing un-scanned commands.
-    if _circuit_open:
-        return _fail(fail_open, "tirith disabled (circuit breaker)",
-                     "tirith unavailable: circuit breaker opened after repeated scanner failures. "
-                     + _ACK_HINT)
+    # Circuit breaker: if tirith has crashed _CRASH_LIMIT times in a row in this scope, stop trying
+    # for a while. Without this, a corrupted or missing binary causes every tool call to hit the same
+    # spawn failure → agent retry loop, hanging the user for 20+ minutes (issue #41400). Fail-closed
+    # default: the open breaker BLOCKS instead of silently allowing un-scanned commands. Recovery is
+    # bounded, not impossible: one re-probe per interval re-runs resolution + spawn, so a scanner
+    # restored after the trip resumes scanning without a process restart.
+    if _breaker_open():
+        if not _breaker_reprobe_allowed():
+            return _fail(fail_open, "tirith disabled (circuit breaker)",
+                         "tirith unavailable: circuit breaker opened after repeated scanner "
+                         "failures. Restore the scanner — scanning resumes automatically on the "
+                         "next re-probe — or use the supported reset. " + _ACK_HINT,
+                         reason=REASON_CIRCUIT_BREAKER, breaker_open=True)
 
     # No binary for this platform, ever: skip the resolver so we never spawn.
     if not is_platform_supported():
         return _fail(fail_open, "tirith has no build for this platform",
                      "tirith is not available for this platform, so the command cannot be scanned. "
-                     + _ACK_HINT)
+                     + _ACK_HINT, reason=REASON_UNSUPPORTED_PLATFORM)
     tirith_path = _resolve_tirith_path(cfg["tirith_path"])
     timeout = cfg["tirith_timeout"]
     if tirith_path is None:
         _warn_once("tirith_path_none", "tirith path resolved to None; scanning disabled")
         return _fail(fail_open, "tirith path unavailable",
-                     "tirith path unavailable (fail-closed). " + _ACK_HINT)
+                     "tirith path unavailable (fail-closed). " + _ACK_HINT,
+                     reason=REASON_PATH_UNAVAILABLE, attempted_path=cfg["tirith_path"])
     try:
         result = subprocess.run(
             [tirith_path, "check", "--json", "--non-interactive", "--shell", "posix", "--", command],
             capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=timeout,
             stdin=subprocess.DEVNULL)
     except OSError as exc:
-        # FileNotFoundError / PermissionError / exec format error: dedupe by (class, errno)
-        # so each failure mode surfaces once, not per command.
+        # FileNotFoundError / PermissionError / exec format error: dedupe the LOGGER line by
+        # (class, errno) so each failure mode is not repeated per command — the degradation EVENT is
+        # still emitted per affected command by _degraded().
         _warn_once(f"tirith_spawn_failed:{type(exc).__name__}:{getattr(exc, 'errno', '')}",
                    "tirith spawn failed: %s", exc)
-        return _crash(fail_open, f"tirith unavailable: {exc}", f"tirith spawn failed (fail-closed): {exc}. " + _ACK_HINT)
+        return _crash(fail_open, f"tirith unavailable: {exc}",
+                      f"tirith spawn failed (fail-closed): {exc}. " + _ACK_HINT,
+                      reason=REASON_SPAWN_FAILED, attempted_path=cfg["tirith_path"],
+                      resolved_path=tirith_path)
     except subprocess.TimeoutExpired:
         _warn_once(f"tirith_timeout:{timeout}", "tirith timed out after %ds", timeout)
-        return _crash(fail_open, f"tirith timed out ({timeout}s)", f"tirith timed out after {timeout}s (fail-closed). " + _ACK_HINT)
+        return _crash(fail_open, f"tirith timed out ({timeout}s)",
+                      f"tirith timed out after {timeout}s (fail-closed). " + _ACK_HINT,
+                      reason=REASON_TIMEOUT, attempted_path=cfg["tirith_path"],
+                      resolved_path=tirith_path)
     exit_code = result.returncode
     if (action := _EXIT_ACTIONS.get(exit_code)) is None:
         # Unknown exit code (includes signal-killed, e.g. -11): respect fail_open.
         logger.warning("tirith returned unexpected exit code %d", exit_code)
         return _crash(fail_open, f"tirith exit code {exit_code} (fail-open)",
-                      f"tirith exit code {exit_code} (fail-closed). " + _ACK_HINT)
-    if action == "allow":
-        _crash_count = 0  # successful execution resets the circuit breaker
+                      f"tirith exit code {exit_code} (fail-closed). " + _ACK_HINT,
+                      reason=REASON_UNKNOWN_EXIT, attempted_path=cfg["tirith_path"],
+                      resolved_path=tirith_path)
+    # A recognized exit code means the scanner RAN: any verdict (allow/block/warn) is a successful
+    # execution, so the breaker closes here and the failure count clears.
+    _reset_breaker()
 
     # JSON enriches findings/summary; a parse failure never changes the verdict.
     findings, summary = [], ""
