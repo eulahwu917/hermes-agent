@@ -3261,6 +3261,7 @@ def edit_task(
 def block_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
+    signal_fn=None,
 ) -> bool:
     """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
     :func:`_route_block`). ``kind='dependency'`` with no incomplete parent is
@@ -3275,12 +3276,23 @@ def block_task(
     audit event is appended, while status, failure evidence and the terminal
     runs stay exactly as the breaker left them. A typed block, a card with a
     live run, or a kind-less call on a blocked card are still refused.
+
+    A ``running`` worker's OS process is terminated and reaped AFTER the block
+    commits: nulling ``worker_pid`` alone left the process alive and editing
+    the worktree past its own block, where it collided with the successor run
+    spawned on unblock (t_fdab14a7). The kill is contingent on THIS txn
+    winning the transition (pid snapshot inside the txn, signal after commit,
+    so a losing concurrent blocker never signals it); the outcome lands as a
+    ``block_worker_termination`` event. ``signal_fn`` is a test hook.
+
     """
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
+    prev_worker: Optional[tuple[int, Optional[str]]] = None
     with write_txn(conn):
         cur_row = conn.execute(
-            "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
+            "SELECT status, claim_lock, worker_pid, block_kind, block_recurrences "
+            "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if cur_row is None:
             return False
@@ -3306,6 +3318,11 @@ def block_task(
                 "kind": kind, "reason": reason, "classified_in_place": True,
             })
             return True
+        if cur_row["status"] == "running" and cur_row["worker_pid"]:
+            # Snapshot BEFORE the UPDATE nulls the pid: winning this txn is
+            # what authorizes signalling it.
+            prev_worker = (int(cur_row["worker_pid"]), cur_row["claim_lock"])
+
         source_status = _retry_status_for_run(conn, task_id) if cur_row["status"] == "running" else "ready"
         requested_kind = kind
         rekind_reason = None
@@ -3347,8 +3364,26 @@ def block_task(
         if kind == "dependency":
             # Historical ordering: the dependency lane fires inside the txn.
             _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
-            return True
-    _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
+            dependency_handoff = True
+        else:
+            dependency_handoff = False
+    if prev_worker is not None:
+        # Post-commit: the audit trail is durable, so the handoff can kill the
+        # worker now (``_terminate_reclaimed_worker`` polls ~5 s and must not
+        # hold the write lock).
+        pid, prev_lock = prev_worker
+        termination = _terminate_and_reap_worker(pid, prev_lock, signal_fn=signal_fn)
+        if _worker_survived_termination(termination):
+            _log.warning(
+                "kanban block: worker pid %s for task %s SURVIVED the block "
+                "handoff (still alive after SIGTERM/SIGKILL) — a successor run "
+                "must not be spawned beside it until its parent reaps it; "
+                "termination=%r", pid, task_id, termination,
+            )
+        with write_txn(conn):
+            _append_event(conn, task_id, "block_worker_termination", termination, run_id=run_id)
+    if not dependency_handoff:
+        _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
     return True
 
 
@@ -4510,6 +4545,8 @@ from hermes_cli.kanban_db_dispatch import (  # noqa: E402
     _defer_reclaim_for_live_worker,
     _pid_alive,
     _record_task_failure,
+    _terminate_and_reap_worker,
+
     _terminate_reclaimed_worker,
     _worker_alive,
     _worker_survived_termination,

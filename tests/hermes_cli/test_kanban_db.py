@@ -2149,3 +2149,175 @@ def test_archive_non_running_task_does_not_attempt_termination(kanban_home):
             (t,),
         ).fetchone()
         assert row is None
+
+
+# ---------------------------------------------------------------------------
+# Block-handoff worker termination + reap (t_fc49c7dc): a blocked run's
+# worker process must not survive its own handoff — it kept editing the
+# worktree and collided with the successor run spawned on unblock.
+# ---------------------------------------------------------------------------
+
+
+def test_block_running_task_terminates_and_reaps_worker(kanban_home):
+    """``block_task`` on a *running* task must actually terminate AND reap its
+    host-local worker process, not merely null ``worker_pid`` in the DB
+    (#t_fc49c7dc). The outcome is auditable via the ``block_worker_termination``
+    event. A REAL child is spawned so the test process is its parent and the
+    reap is provable: after the handoff a ``waitpid`` raises (no zombie)."""
+    import contextlib
+    import json
+    import os
+
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    try:
+        with kbc.connect() as conn:
+            t = kb.create_task(conn, title="x", assignee="a")
+            host = kb._claimer_id().split(":", 1)[0]
+            kb.claim_task(conn, t, claimer=f"{host}:worker")
+            kbd._set_worker_pid(conn, t, child.pid)
+
+            assert kb.block_task(conn, t, reason="need input") is True
+
+            task = kb.get_task(conn, t)
+            assert task.status == "blocked"
+            assert task.worker_pid is None
+            assert task.claim_lock is None
+
+            # Gone AND reaped (no zombie left for the parent).
+            assert not kbd._pid_alive(child.pid)
+            with pytest.raises(ChildProcessError):
+                os.waitpid(child.pid, os.WNOHANG)
+
+            row = conn.execute(
+                "SELECT payload FROM task_events "
+                "WHERE task_id = ? AND kind = 'block_worker_termination'",
+                (t,),
+            ).fetchone()
+            assert row is not None
+            payload = json.loads(row["payload"])
+            assert payload["prev_pid"] == child.pid
+            assert payload["host_local"] is True
+            assert payload["termination_attempted"] is True
+            assert payload["terminated"] is True
+            assert payload["reaped"] is True
+    finally:
+        if child.poll() is None:
+            child.kill()
+        with contextlib.suppress(ChildProcessError, OSError):
+            os.waitpid(child.pid, os.WNOHANG)
+
+
+def test_stale_block_attempt_does_not_signal_worker(kanban_home, monkeypatch):
+    """A stale run's ``block_task`` (wrong ``expected_run_id``) loses the
+    transition CAS and must NOT signal the current run's worker — the kill is
+    authorized only by winning the transition."""
+    signalled: list = []
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="a")
+        host = kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, t, claimer=f"{host}:worker")
+        kbd._set_worker_pid(conn, t, 54321)
+        run1 = kb.latest_run(conn, t)
+
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+        assert kbd.detect_crashed_workers(conn) == [t]
+        kb.claim_task(conn, t, claimer=f"{host}:worker")
+
+        assert kb.block_task(
+            conn, t, reason="late block", expected_run_id=run1.id,
+            signal_fn=lambda pid, sig: signalled.append((pid, sig)),
+        ) is False
+        assert signalled == []
+        assert kb.get_task(conn, t).status == "running"
+
+
+def test_blocked_worker_gone_before_successor_spawns(kanban_home, all_assignees_spawnable):
+    """Full handoff regression: block a running card whose worker is a real
+    process, unblock it, dispatch the successor — the first process must be
+    gone AND reaped before the successor's spawn runs."""
+    import contextlib
+    import os
+
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    observed: dict = {}
+    try:
+        with kbc.connect() as conn:
+            t = kb.create_task(conn, title="x", assignee="alice")
+            host = kb._claimer_id().split(":", 1)[0]
+            kb.claim_task(conn, t, claimer=f"{host}:worker")
+            kbd._set_worker_pid(conn, t, child.pid)
+            assert kb.block_task(conn, t, reason="need input")
+            assert kb.unblock_task(conn, t)
+
+            def spawn_fn(task, workspace, board=None):
+                observed["first_gone"] = not kbd._pid_alive(child.pid)
+                try:
+                    os.waitpid(child.pid, os.WNOHANG)
+                    observed["first_reaped"] = False
+                except ChildProcessError:
+                    observed["first_reaped"] = True
+                return 12345
+
+            res = kbd.dispatch_once(conn, spawn_fn=spawn_fn, max_in_progress=4)
+            assert res.spawned and res.spawned[0][0] == t
+            assert observed["first_gone"] is True
+            assert observed["first_reaped"] is True
+    finally:
+        if child.poll() is None:
+            child.kill()
+        with contextlib.suppress(ChildProcessError, OSError):
+            os.waitpid(child.pid, os.WNOHANG)
+
+
+def test_successor_spawn_warns_when_blocked_worker_survived(
+    kanban_home, all_assignees_spawnable, monkeypatch, caplog,
+):
+    """If the blocked run's worker SURVIVED its handoff (SIGTERM/SIGKILL could
+    not stop it), the successor claim must say so loudly — a warning plus a
+    ``superseded_worker_alive`` event — instead of silently spawning a second
+    writer beside it."""
+    import json
+
+    monkeypatch.setattr(kbd, "_poll_worker_exit", lambda pid: False)  # no 5 s poll
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: _pid == 54321)  # survivor
+
+    signalled: list = []
+    with kbc.connect() as conn:
+        t = kb.create_task(conn, title="x", assignee="alice")
+        host = kb._claimer_id().split(":", 1)[0]
+        kb.claim_task(conn, t, claimer=f"{host}:worker")
+        kbd._set_worker_pid(conn, t, 54321)
+
+        assert kb.block_task(
+            conn, t, reason="need input",
+            signal_fn=lambda pid, sig: signalled.append((pid, sig)),
+        ) is True
+        assert kb.get_task(conn, t).status == "blocked"
+        assert signalled  # SIGTERM + SIGKILL were attempted
+        assert kb.unblock_task(conn, t) is True
+
+        spawns: list = []
+        res = kbd.dispatch_once(
+            conn, spawn_fn=lambda task, workspace, board=None: spawns.append(task.id) or 42,
+            max_in_progress=4,
+        )
+        assert [s[0] for s in res.spawned] == [t]
+
+        row = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'superseded_worker_alive'",
+            (t,),
+        ).fetchone()
+        assert row is not None
+        assert json.loads(row["payload"])["pid"] == 54321
+
+    assert "STILL ALIVE" in caplog.text

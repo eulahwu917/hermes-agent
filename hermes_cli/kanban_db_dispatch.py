@@ -308,6 +308,92 @@ def reap_worker_zombies() -> "list[int]":
     return reaped
 
 
+def _reap_worker_pid(pid: int) -> "tuple[bool, Optional[int]]":
+    """Boundedly reap ONE specific worker child; ``(reaped, raw_wait_status)``.
+
+    Only the child's PARENT may ``waitpid`` it: a caller that merely signalled
+    the pid (a worker terminating itself, a standalone CLI) gets
+    ``ChildProcessError`` and returns ``(False, None)`` — the real parent's
+    ``reap_worker_zombies`` loop collects it there. Polls ~1 s because a
+    just-killed child reaches zombie state shortly after the kill returns.
+    No-op on Windows (``os.waitpid`` is POSIX-only).
+    """
+    if os.name == "nt" or not pid or pid <= 0:
+        return False, None
+    deadline = time.monotonic() + 1.0
+    while True:
+        try:
+            waited, raw = os.waitpid(int(pid), os.WNOHANG)
+        except (ChildProcessError, OSError):
+            return False, None
+        if waited == int(pid):
+            _record_worker_exit(waited, raw)
+            return True, raw
+        if time.monotonic() >= deadline:
+            return False, None
+        time.sleep(0.05)
+
+
+def _terminate_and_reap_worker(
+    pid: Optional[int],
+    claim_lock: Optional[str],
+    *,
+    signal_fn=None,
+) -> dict[str, Any]:
+    """Terminate AND reap a host-local worker at a handoff.
+
+    A "terminated" process nobody waited on stays a zombie whose exit status
+    lingers; the t_fdab14a7 orphan proved a blocked run's worker could also
+    survive its own handoff outright and keep writing the worktree beside its
+    successor. Reuses :func:`_terminate_reclaimed_worker` (SIGTERM → poll →
+    SIGKILL), then reaps the specific pid. Returns the termination report
+    extended with ``reaped`` (bool) and ``reap_wait_status`` when a wait
+    status was collected; ``reaped=False`` is EXPECTED when the caller is not
+    the child's parent — the parent collects it via its own
+    ``reap_worker_zombies`` loop.
+    """
+    termination = _terminate_reclaimed_worker(pid, claim_lock, signal_fn=signal_fn)
+    reaped, raw = _reap_worker_pid(int(pid)) if pid and pid > 0 else (False, None)
+    termination["reaped"] = reaped
+    if raw is not None:
+        termination["reap_wait_status"] = raw
+    return termination
+
+
+def _last_surviving_worker_pid(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
+    """Pid of a worker whose block handoff FAILED to terminate it, if any.
+
+    Reads the most recent ``block_worker_termination`` event and returns its
+    ``prev_pid`` when the event records a host-local worker with
+    ``terminated=False`` — the pid a successor claim must flag loudly before
+    spawning a second writer. ``None`` when there is no such event, the
+    payload is malformed, or the recorded handoff succeeded / was not
+    host-local.
+    """
+    import json
+
+    row = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'block_worker_termination' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(row["payload"] or "{}")
+    except ValueError:
+        return None
+    if not isinstance(payload, dict) or not payload.get("host_local"):
+        return None
+    if payload.get("terminated") is not False:
+        return None
+    try:
+        return int(payload["prev_pid"]) if payload.get("prev_pid") else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _pid_alive(pid: Optional[int]) -> bool:
     """Return True if ``pid`` is still running on this host.
 
@@ -2052,6 +2138,26 @@ def _dispatch_lane_task(
     claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
     if claimed is None:
         return False
+    # Successor-claim handoff observability: if the task's previous worker
+    # process survived its block handoff (block_task records
+    # ``terminated=False`` when SIGTERM/SIGKILL could not stop it), say so
+    # loudly instead of silently spawning a second writer beside it.
+    superseded_pid = _last_surviving_worker_pid(conn, task_id)
+    if superseded_pid and _kb._pid_alive(superseded_pid):
+        _kb._log.warning(
+            "kanban dispatch: task %s is spawning run %s while the previous "
+            "worker pid %s (superseded by a block handoff) is STILL ALIVE — "
+            "two writers are about to share a workspace; the superseded "
+            "process must be stopped and reaped by its parent",
+            task_id, claimed.current_run_id, superseded_pid,
+        )
+        if not dry_run:
+            with _kb.write_txn(conn):
+                _kb._append_event(
+                    conn, task_id, "superseded_worker_alive",
+                    {"pid": superseded_pid, "run_id": claimed.current_run_id},
+                    run_id=claimed.current_run_id,
+                )
     try:
         resolved_branch_name = None
         if claimed.workspace_kind == "worktree":
