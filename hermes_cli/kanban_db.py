@@ -3282,8 +3282,13 @@ def block_task(
     the worktree past its own block, where it collided with the successor run
     spawned on unblock (t_fdab14a7). The kill is contingent on THIS txn
     winning the transition (pid snapshot inside the txn, signal after commit,
-    so a losing concurrent blocker never signals it); the outcome lands as a
-    ``block_worker_termination`` event. ``signal_fn`` is a test hook.
+    so a losing concurrent blocker never signals it). The handoff is durably
+    recorded as a ``block_worker_termination`` event that is appended BEFORE
+    the signal — a worker that blocks ITSELF dies at the SIGTERM, so the
+    record must land first; it carries the termination intent (prev_pid,
+    claim_lock, host_local, termination_attempted), while the actual exit
+    status is recorded by the worker's parent in its reap registry
+    (``reap_worker_zombies``). ``signal_fn`` is a test hook.
 
     """
     if kind is not None and kind not in VALID_BLOCK_KINDS:
@@ -3367,11 +3372,28 @@ def block_task(
             dependency_handoff = True
         else:
             dependency_handoff = False
+    if not dependency_handoff:
+        # Fire BEFORE terminating the worker: the hook is documented to run
+        # in the process that drove the transition (plugins.py), and a
+        # worker that blocks ITSELF dies at the SIGTERM below — firing it
+        # after the kill would silently drop it on the dominant path.
+        _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
     if prev_worker is not None:
-        # Post-commit: the audit trail is durable, so the handoff can kill the
-        # worker now (``_terminate_reclaimed_worker`` polls ~5 s and must not
-        # hold the write lock).
+        # Post-commit: the block is durable, so the handoff can kill the
+        # worker now (``_terminate_reclaimed_worker`` polls ~5 s and must
+        # not hold the write lock).
         pid, prev_lock = prev_worker
+        # Record the handoff intent BEFORE signalling: a worker that blocks
+        # ITSELF dies at SIGTERM, so any post-signal append would never
+        # land. The event carries the intent (prev_pid/claim_lock/host_local
+        # /termination_attempted); the ACTUAL exit status is recorded by the
+        # worker's parent in its in-memory reap registry.
+        with write_txn(conn):
+            _append_event(
+                conn, task_id, "block_worker_termination",
+                _termination_intent(pid, prev_lock, signal_fn=signal_fn),
+                run_id=run_id,
+            )
         termination = _terminate_and_reap_worker(pid, prev_lock, signal_fn=signal_fn)
         if _worker_survived_termination(termination):
             _log.warning(
@@ -3380,10 +3402,6 @@ def block_task(
                 "must not be spawned beside it until its parent reaps it; "
                 "termination=%r", pid, task_id, termination,
             )
-        with write_txn(conn):
-            _append_event(conn, task_id, "block_worker_termination", termination, run_id=run_id)
-    if not dependency_handoff:
-        _fire_task_hook("kanban_task_blocked", blocked_task, task_id, run_id, reason=reason)
     return True
 
 
@@ -4546,6 +4564,7 @@ from hermes_cli.kanban_db_dispatch import (  # noqa: E402
     _pid_alive,
     _record_task_failure,
     _terminate_and_reap_worker,
+    _termination_intent,
 
     _terminate_reclaimed_worker,
     _worker_alive,

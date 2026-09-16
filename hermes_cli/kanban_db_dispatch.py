@@ -361,14 +361,16 @@ def _terminate_and_reap_worker(
 
 
 def _last_surviving_worker_pid(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
-    """Pid of a worker whose block handoff FAILED to terminate it, if any.
+    """Pid of a worker whose block handoff we ATTEMPTED to terminate, if any.
 
     Reads the most recent ``block_worker_termination`` event and returns its
-    ``prev_pid`` when the event records a host-local worker with
-    ``terminated=False`` — the pid a successor claim must flag loudly before
-    spawning a second writer. ``None`` when there is no such event, the
-    payload is malformed, or the recorded handoff succeeded / was not
-    host-local.
+    ``prev_pid`` when the event records a host-local worker we were going to
+    kill — the only shape whose worker may still be alive. That event is
+    written BEFORE the signal (a self-blocking worker dies at SIGTERM), so it
+    carries the termination INTENT rather than the outcome; the caller must
+    therefore check ``_pid_alive`` before treating the pid as a live second
+    writer. ``None`` when there is no such event, the payload is malformed,
+    or the handoff was not a host-local termination attempt.
     """
     import json
 
@@ -386,7 +388,7 @@ def _last_surviving_worker_pid(conn: sqlite3.Connection, task_id: str) -> Option
         return None
     if not isinstance(payload, dict) or not payload.get("host_local"):
         return None
-    if payload.get("terminated") is not False:
+    if not payload.get("termination_attempted"):
         return None
     try:
         return int(payload["prev_pid"]) if payload.get("prev_pid") else None
@@ -526,6 +528,41 @@ def _sigkill(kill, pid: int) -> bool:
         return False
 
 
+def _termination_intent(
+    pid: Optional[int],
+    claim_lock: Optional[str],
+    *,
+    signal_fn=None,
+) -> dict[str, Any]:
+    """Pre-signal intent record for ``block_task``'s ``block_worker_termination``
+    event. Gating mirrors :func:`_terminate_reclaimed_worker` (whose docstring
+    cross-references this helper) so the durable event is truthful about
+    whether a termination WILL be attempted (a host-local worker with a live
+    kill primitive) without sending any signal.
+
+    It must be appended BEFORE the kill: a worker that blocks ITSELF dies at
+    the SIGTERM, so any post-signal append would never land (t_fdab14a7).
+    The actual exit status is recorded separately by the worker's parent in
+    its reap registry (:func:`reap_worker_zombies` / :func:`_reap_worker_pid`),
+    not by this event.
+    """
+    info: dict[str, Any] = {
+        "prev_pid": int(pid) if pid else None,
+        "claim_lock": claim_lock,
+        "host_local": False,
+        "termination_attempted": False,
+    }
+    if not pid or pid <= 0 or not claim_lock:
+        return info
+    if not str(claim_lock).startswith(_kb._host_prefix()):
+        return info
+    info["host_local"] = True
+    if _kill_fn(signal_fn) is None:
+        return info
+    info["termination_attempted"] = True
+    return info
+
+
 def _terminate_reclaimed_worker(
     pid: Optional[int],
     claim_lock: Optional[str],
@@ -533,12 +570,10 @@ def _terminate_reclaimed_worker(
     signal_fn=None,
     started_at=None,
 ) -> dict[str, Any]:
-    """Best-effort host-local worker termination for reclaim paths. ``started_at`` is the spawn-time
-    fingerprint: when the live process no longer matches it, the PID was recycled and nothing is
-    signalled — the worker is gone, which is what the reclaim wanted (``terminated`` = True). An
-    UNVERIFIED spawn (fingerprint capture failed) that is still live is never signalled either, but
-    it is reported as surviving (``signal_refused``) so the reclaim holds the claim instead of
-    spawning a duplicate beside it."""
+    """Best-effort host-local worker termination for reclaim paths.
+
+    Gating mirrors :func:`_termination_intent`; keep both in sync."""
+
     info: dict[str, Any] = {
         "prev_pid": int(pid) if pid else None,
         "host_local": False,
@@ -2138,10 +2173,12 @@ def _dispatch_lane_task(
     claimed = claim(conn, task_id, ttl_seconds=ttl_seconds)
     if claimed is None:
         return False
-    # Successor-claim handoff observability: if the task's previous worker
-    # process survived its block handoff (block_task records
-    # ``terminated=False`` when SIGTERM/SIGKILL could not stop it), say so
-    # loudly instead of silently spawning a second writer beside it.
+    # Successor-claim handoff observability: the block handoff's
+    # ``block_worker_termination`` event is written PRE-signal (a
+    # self-blocking worker dies at SIGTERM), so it records the termination
+    # INTENT, not the outcome. If that previous worker pid is still alive
+    # when the successor claims the card, say so loudly instead of silently
+    # spawning a second writer beside it.
     superseded_pid = _last_surviving_worker_pid(conn, task_id)
     if superseded_pid and _kb._pid_alive(superseded_pid):
         _kb._log.warning(

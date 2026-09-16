@@ -2161,12 +2161,16 @@ def test_archive_non_running_task_does_not_attempt_termination(kanban_home):
 def test_block_running_task_terminates_and_reaps_worker(kanban_home):
     """``block_task`` on a *running* task must actually terminate AND reap its
     host-local worker process, not merely null ``worker_pid`` in the DB
-    (#t_fc49c7dc). The outcome is auditable via the ``block_worker_termination``
-    event. A REAL child is spawned so the test process is its parent and the
-    reap is provable: after the handoff a ``waitpid`` raises (no zombie)."""
+    (#t_fc49c7dc). A REAL child is spawned so the test process is its parent
+    and the reap is provable: after the handoff a ``waitpid`` raises (no
+    zombie), and the exit status is visible in the parent's reap registry.
+    The ``block_worker_termination`` event is the PRE-signal intent record:
+    it carries prev_pid/claim_lock/host_local/termination_attempted but never
+    the outcome (a self-blocking worker dies before any post-signal write)."""
     import contextlib
     import json
     import os
+    import signal
 
     child = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(60)"],
@@ -2199,11 +2203,19 @@ def test_block_running_task_terminates_and_reaps_worker(kanban_home):
             ).fetchone()
             assert row is not None
             payload = json.loads(row["payload"])
+            # Pre-signal INTENT record: prev_pid/claim_lock/host_local/attempt
+            # only. The outcome is never written here — a self-blocking worker
+            # dies before any post-signal append — it lives in the parent's
+            # reap registry, asserted below via _classify_worker_exit.
             assert payload["prev_pid"] == child.pid
+            assert payload["claim_lock"] == f"{host}:worker"
             assert payload["host_local"] is True
             assert payload["termination_attempted"] is True
-            assert payload["terminated"] is True
-            assert payload["reaped"] is True
+            assert "terminated" not in payload
+            assert "reaped" not in payload
+            kind, code = kbd._classify_worker_exit(child.pid)
+            assert kind == "signaled"
+            assert code == signal.SIGTERM
     finally:
         if child.poll() is None:
             child.kill()
@@ -2234,6 +2246,122 @@ def test_stale_block_attempt_does_not_signal_worker(kanban_home, monkeypatch):
         ) is False
         assert signalled == []
         assert kb.get_task(conn, t).status == "running"
+
+
+def test_self_block_worker_dies_before_successor_spawns(
+    kanban_home, all_assignees_spawnable,
+):
+    """The t_fdab14a7 shape: the WORKER blocks ITS OWN task — it holds the
+    claim and its worker_pid is its own pid. block_task must (a) commit the
+    block, (b) fire the kanban_task_blocked hook BEFORE the termination (the
+    worker dies at the SIGTERM, so a post-kill fire would never run), (c)
+    durably record the block_worker_termination intent pre-signal, and (d)
+    die reaped so the successor run spawned on unblock never shares a
+    workspace with a still-writing predecessor."""
+    import contextlib
+    import json
+
+    child_script = chr(10).join(
+        [
+            "import json",
+            "import os",
+            "import sys",
+            "from hermes_cli import kanban_db as kb",
+            "from hermes_cli import kanban_db_connect as kbc",
+            "from hermes_cli import kanban_db_dispatch as kbd",
+            "task_id, marker = sys.argv[1], sys.argv[2]",
+            "_orig_fire = kb._fire_task_hook",
+            "def _spy_fire(event, task, tid, run_id, **fields):",
+            "    with open(marker, 'a', encoding='utf-8') as f:",
+            "        f.write(json.dumps({'event': event, 'task_id': tid,",
+            "                           'reason': fields.get('reason')}) + chr(10))",
+            "        f.flush()",
+            "    _orig_fire(event, task, tid, run_id, **fields)",
+            "kb._fire_task_hook = _spy_fire",
+            "conn = kbc.connect()",
+            "host = kb._claimer_id().split(':', 1)[0]",
+            "assert kb.claim_task(conn, task_id, claimer=host + ':selfworker') is not None",
+            "kbd._set_worker_pid(conn, task_id, os.getpid())",
+            "assert kb.block_task(conn, task_id, reason='need input') is True",
+            "print('UNREACHABLE', flush=True)",
+        ]
+    )
+    marker = kanban_home / "self-block-hook-marker.jsonl"
+
+    child = None
+    try:
+        with kbc.connect() as conn:
+            t = kb.create_task(conn, title="x", assignee="alice")
+
+            child = subprocess.Popen(
+                [sys.executable, "-c", child_script, t, str(marker)],
+                env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            child.wait(timeout=30)
+            assert child.returncode < 0, "worker must die by signal, not return"
+
+            # Reapable, not an unreaped zombie: wait() already reaped it.
+            with pytest.raises(ChildProcessError):
+                os.waitpid(child.pid, os.WNOHANG)
+            assert not kbd._pid_alive(child.pid)
+
+            task = kb.get_task(conn, t)
+            assert task.status == "blocked"
+            assert task.worker_pid is None
+
+            # Hook fired BEFORE the kill: the marker is written inside the
+            # kanban_task_blocked hook, so a post-kill fire would leave no
+            # record. The blocked hook must be the LAST hook the worker fired.
+            records = [
+                json.loads(line)
+                for line in marker.read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            assert records, "no lifecycle hook fired in the self-blocking worker"
+            assert records[-1] == {
+                "event": "kanban_task_blocked", "task_id": t, "reason": "need input",
+            }
+
+            # Handoff intent event landed pre-signal (a post-signal append is
+            # impossible in the self-kill path — the process is dead by then).
+            row = conn.execute(
+                "SELECT payload FROM task_events "
+                "WHERE task_id = ? AND kind = 'block_worker_termination'",
+                (t,),
+            ).fetchone()
+            assert row is not None
+            payload = json.loads(row["payload"])
+            assert payload["prev_pid"] == child.pid
+            assert payload["claim_lock"].endswith(":selfworker")
+            assert payload["host_local"] is True
+            assert payload["termination_attempted"] is True
+
+            # Unblock -> successor spawns with the first process gone.
+            assert kb.unblock_task(conn, t) is True
+            observed: dict = {}
+
+            def spawn_fn(task, workspace, board=None):
+                observed["first_gone"] = not kbd._pid_alive(child.pid)
+                return 12345
+
+            res = kbd.dispatch_once(conn, spawn_fn=spawn_fn, max_in_progress=4)
+            assert res.spawned and res.spawned[0][0] == t
+            assert observed["first_gone"] is True
+
+            # The survivor backstop must NOT fire for a worker that died.
+            assert conn.execute(
+                "SELECT 1 FROM task_events "
+                "WHERE task_id = ? AND kind = 'superseded_worker_alive'",
+                (t,),
+            ).fetchall() == []
+    finally:
+        if child is not None and child.poll() is None:
+            child.kill()
+        if child is not None:
+            with contextlib.suppress(ChildProcessError, OSError):
+                os.waitpid(child.pid, os.WNOHANG)
 
 
 def test_blocked_worker_gone_before_successor_spawns(kanban_home, all_assignees_spawnable):
