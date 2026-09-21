@@ -418,6 +418,8 @@ class CronAction(WireEnum):
     remove = "remove"
     pause = "pause"
     resume = "resume"
+    list_attention = "list_attention"
+    ack_attention = "ack_attention"
 
 
 class CronManageParams(Params):
@@ -430,6 +432,13 @@ class CronManageParams(Params):
     continuity: bool | str | None = None
     deliver: str | None = None
     profile: str | None = None
+    # Unified Attention read model (spec §4.2): the RAW filter values pass through untouched
+    # so the handler's strict validation (4066) — never a lossy contract coercion — catches
+    # falsey/non-string ``open_only``/``state``. ``kind``/``id`` are the ack_attention keys.
+    open_only: JsonValue | None = None
+    state: JsonValue | None = None
+    kind: str | None = None
+    id: str | None = None
 
 
 class CronJobRow(_Open):

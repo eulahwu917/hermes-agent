@@ -2415,7 +2415,7 @@ def test_successor_spawn_warns_when_blocked_worker_survived(
     writer beside it."""
     import json
 
-    monkeypatch.setattr(kbd, "_poll_worker_exit", lambda pid: False)  # no 5 s poll
+    monkeypatch.setattr(kbd, "_poll_worker_exit", lambda pid, started_at=None: False)  # no 5 s poll
     monkeypatch.setattr(kb, "_pid_alive", lambda _pid: _pid == 54321)  # survivor
 
     signalled: list = []

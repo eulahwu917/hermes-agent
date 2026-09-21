@@ -370,7 +370,8 @@ def test_cli_list_and_ack(monkeypatch, tmp_path, capsys):
 def test_alerted_gate_honours_cooldown_opt_out_and_legacy_rows(monkeypatch, tmp_path):
     """Unit level: ``alerted`` withholds only inside the cooldown; ``0`` restores per-run
     alerts; a pre-migration row (state alerted, no ``alerted_at``) delivers rather than
-    swallowing the alert; ``closed`` still wins regardless of the cooldown."""
+    swallowing the alert. A recurrence after an ack re-arms as a NEW episode — carried
+    episodic re-arm, ``ack`` is NOT permanent suppression for a repeating alarm."""
     inc = _point_db(monkeypatch, tmp_path)
     monkeypatch.setattr(sched, "_failure_repeat_alert_hours", lambda: 6.0)
     job = _job()
@@ -395,4 +396,10 @@ def test_alerted_gate_honours_cooldown_opt_out_and_legacy_rows(monkeypatch, tmp_
 
     assert inc.ack_incident(inc_id) is True
     monkeypatch.setattr(sched, "_failure_repeat_alert_hours", lambda: 0)
-    assert sched._upsert_incident_for_failure(job, "repeat boom") == (True, inc_id)
+    # Episodic re-arm (carried design): an ack CLOSES this episode, but the same signature
+    # recurring mints a NEW episode row — the repeating alarm is re-armed, not permanently
+    # suppressed by the ack.
+    new_withheld, new_id = sched._upsert_incident_for_failure(job, "repeat boom")
+    assert new_withheld is False  # a fresh (detected) episode alerts again, even at cooldown 0
+    assert new_id is not None and new_id != inc_id
+    assert new_id == f"{inc_id}_e2"

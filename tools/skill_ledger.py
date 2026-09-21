@@ -627,9 +627,6 @@ def append_entry(
     if not ledger_enabled():
         return None
     try:
-        # pre-rollback deliberately records before == after (the current state of every touched path).
-        if action != "pre-rollback":
-            before, after = _delta(before or [], after or [])
         entry = {
             "id": uuid.uuid4().hex[:12], "ts": datetime.now(timezone.utc).isoformat(),
             "actor": actor if actor in _VALID_ACTORS else derive_actor(),
