@@ -21,7 +21,7 @@ carrying before you start.
 
 ## Currently carried
 
-Carried commit count (ahead of origin/main; machine-checked by the weekly tier-1 check — update when rows are rebased/added/retired): 58
+Carried commit count (ahead of the pinned replay base 338b31226d; machine-checked by the weekly tier-1 check — update when rows are rebased/added/retired; live origin/main advanced +66 during the replay, see the rebase notes): 63
 
 | Commit (short) | What it does | Upstream PR | PR status (last checked) | Verify before trusting | Last verified |
 |---|---|---|---|---|---|
@@ -60,6 +60,13 @@ Replayed the carried chain onto `origin/main`@`338b31226d` (the task-start upstr
 **Decisions of record folded in (rows above):** guard hardening `852a4092a6`→`06e495dcf9` re-gated APPROVED at `t_e46b4604` + landing authorised 2026-09-20 (David); the uncommitted deletion-effect guard stays UNCOMMITTED (option (c)), re-apply procedure pinned at `/srv/personal/staging/reports/2026-09-16--governance-audit-infra-host-change-boundary/REAPPLY-PROCEDURE--approval-detection-deletion-effect.md`.
 
 **Not yet run:** desktop `npm run typecheck` + `vitest` + playwright e2e (node_modules not provisioned in this worktree) — the Desktop TS union (i18n/zh/types/hermes + use-background-sync wiring) is mechanical but needs a typecheck/vitest pass before swap-in.
+
+## 2026-09-21 replay fix round 3 (of <=3, gate 7170) — residuals R1/R6/R8
+
+- **R1 (evidence wording only, no auth code):** the ROOT-rescue portion of the reuse-rescue (C3) is no longer called “superseded” — upstream `_sync_codex_pool_entries` (active store only) and `_recover_codex_tokens_from_cli` (Codex CLI) cover different credential sources, so C3's root source stays OPEN alongside C1/C2. The R1 brief now names the four #87503 incidents, the per-behaviour failure situations, the practical loss under upstream's isolation model at file:line, and the migration consequences of BOTH options incl. the un-audited shared-family-copies check on this host. Briefs: /srv/personal/scratch/rebase-20260920/t_e7156788-briefs/.
+- **R6 (code):** skill_ledger no-op receipts now store EMPTY manifests (row stays: action/skill/evidence/timestamps) and `rollback_entry` restores only the entry's own delta, so legacy full-manifest rows and fresh no-ops can never rewind a later independent edit; `pre-rollback` safety captures stay full. `fix(skill-ledger)` commit `5589512364`.
+- **R8 (evidence):** the live-ledger byte pin is qualified for two separately authorized annotation hunks (Attention defer/drop via t_8dce6b92 item 4 / comment 7146; Bepop's “Unrowed carried commits” via session 20260920_195606_0ff7f2 msgs 276696/276701). Original backup `LOCAL_PATCHES.md.pre-rebase.bak` is preserved byte-identical; the new checksum and attribution travel in the R8 evidence for the handover re-pin.
+- **Verify (round 3):** ledger delta/chain/usage/manager + codex retirement-state suites — 6 files, 173 passed / 0 failed; the two new no-op controls were executed RED against the pre-fix bytes first (both reproduced the rewind), then GREEN. Live checkout untouched this round (HEAD `0fd927eda6`; dirty files exactly LOCAL_PATCHES.md + tools/approval_detection.py; guard sha `279e6f62…`); no live service stopped/restarted.
 
 ## 2026-09-06 rebase notes (0.20.5 → 0.21.0, +7,564 upstream commits)
 
