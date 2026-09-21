@@ -13,12 +13,16 @@ retirement, so this equivalent pins the ACTUAL behaviour the tree now has:
   ``tests/hermes_cli/test_auth_profile_isolation.py`` is the authority; here we pin the
   codex-specific consequences: ``_save_codex_tokens`` lands in the ACTIVE profile store and
   the root store is untouched).
-* The supersession functions that DID replace the reuse-rescue exist and are wired:
-  ``_sync_codex_pool_entries`` (singleton→pool alias sync) and
-  ``_recover_codex_tokens_from_cli`` (workspace-identity-gated CLI recovery).
+* Upstream's intra-store alias sync and CLI recovery exist and are wired:
+  ``_sync_codex_pool_entries`` (singleton→pool alias sync, ACTIVE store only) and
+  ``_recover_codex_tokens_from_cli`` (workspace-identity-gated CLI recovery). Neither reads the
+  ROOT store: the dropped root-rescue portion of C3 (adopting a fresher sibling chain from the
+  root Hermes singleton before CLI recovery) has NO upstream successor - see the R1 decision
+  brief, where it stays inside the open decision.
 
-Whether to re-home C1/C2 (cross-profile root write-through) onto the shared-store model is a
-POLICY decision owned by David, not asserted here as either done or dropped.
+Whether to re-home C1/C2 (cross-profile root write-through / root-resolved direct write) and/or
+C3's root-rescue onto the shared-store model is a POLICY decision owned by David, not asserted
+here as either done or dropped.
 """
 
 from __future__ import annotations
@@ -45,7 +49,9 @@ def test_carried_root_writethrough_machinery_is_absent():
 
 
 def test_supersession_functions_exist_and_are_wired():
-    """The upstream replacements that justify the reuse-rescue retirement are present."""
+    """Upstream's intra-store alias sync and CLI recovery are present and callable; note these
+    cover the ACTIVE store and the Codex CLI, not the dropped root-rescue source (ROOT store),
+    which is kept OPEN in the R1 brief rather than treated as superseded (gate 7170)."""
     from hermes_cli.auth_codex import _recover_codex_tokens_from_cli, _save_codex_tokens, _sync_codex_pool_entries
 
     assert callable(_sync_codex_pool_entries)
