@@ -21,7 +21,7 @@ carrying before you start.
 
 ## Currently carried
 
-Carried commit count (ahead of the pinned replay base 338b31226d; machine-checked by the weekly tier-1 check — update when rows are rebased/added/retired; live origin/main advanced +66 during the replay, see the rebase notes): 63
+Carried commit count (ahead of the pinned replay base 338b31226d, EXACT at the final round-3 head incl. this bookkeeping commit; machine-checked by the weekly tier-1 check — update when rows are rebased/added/retired; live origin/main advanced +66 during the replay, see the rebase notes): 65
 
 | Commit (short) | What it does | Upstream PR | PR status (last checked) | Verify before trusting | Last verified |
 |---|---|---|---|---|---|
