@@ -642,15 +642,12 @@ def append_entry(
         # Persist the changed-path delta (upstream: rollback writes every *before* path, so
         # unchanged files are dead weight). The annotation above ran on the FULL maps and the
         # sidecar record below stores the full *after* map, so shrinking the on-disk receipt does
-        # not weaken the chain comparison. A no-op/"hollow" entry (nothing actually changed — the
-        # legacy shape a hollow readback mistakes for a receipt) keeps its rows verbatim, so it
-        # stays readable instead of collapsing to nothing; ``pre-rollback`` always stays full.
+        # not weaken the chain comparison. A no-op entry (nothing actually changed) therefore
+        # stores EMPTY manifests: the receipt row stays (action/skill/evidence/timestamps) but a
+        # newly recorded no-op carries NO restore instructions, so it can never rewind a later
+        # edit. ``pre-rollback`` always stays full (it is the undo-snapshot of a rollback).
         if action != "pre-rollback":
-            changed_before, changed_after = _delta(entry["before"], entry["after"])
-            hollow = bool(entry["before"] and entry["after"]
-                          and not changed_before and not changed_after)
-            if not hollow:
-                entry["before"], entry["after"] = changed_before, changed_after
+            entry["before"], entry["after"] = _delta(entry["before"], entry["after"])
         path = ledger_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "a", encoding="utf-8") as fh:
@@ -833,7 +830,10 @@ def rollback_entry(entry_id: str) -> Tuple[bool, str]:
     agent/curator_backup.rollback): every before-blob must exist BEFORE any change, and a
     pre-rollback safety entry of every touched path's CURRENT state is appended first.
 
-    1. 2. See #63366.
+    Only the entry's OWN delta is restored: identical (path, hash) pairs were never changed
+    by the mutation, so a no-op receipt — or a legacy full-manifest entry — cannot rewind a
+    later independent edit to those paths. ``pre-rollback`` entries stay full: they are
+    undo-snapshots and must restore exactly what they captured. See #63366.
     """
     entry = get_entry(entry_id)
     if entry is None:
@@ -851,6 +851,13 @@ def rollback_entry(entry_id: str) -> Tuple[bool, str]:
             skill=str(entry.get("skill") or "") or None)
         if path_err := _validate_entry_paths({**entry, "before": before, "after": after}):
             return False, f"refusing rollback: {path_err}"
+    # Restore set = the mutation's OWN delta: identical (path, hash) pairs were never changed
+    # by this entry. Entries recorded under older shapes (full manifests, the former no-op
+    # retention) keep their rows for readability, but rolling them back must not rewind a later
+    # independent edit — and must agree with what ``compact_ledger`` stores. ``pre-rollback``
+    # stays full: it is the undo-snapshot of a rollback and must restore exactly what it captured.
+    if entry.get("action") != "pre-rollback":
+        before, after = _delta(before, after)
     # Pre-check every blob we need so we never fail mid-restore.
     for item in before:
         if read_blob(str(item.get("sha256", ""))) is None:

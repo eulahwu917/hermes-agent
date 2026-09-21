@@ -168,9 +168,9 @@ def test_references_patch_receipt_names_the_patched_file_with_real_hashes(ledger
 
 
 def test_skill_md_patch_behaviour_and_legacy_entry_readability(ledger_env):
-    """SKILL.md-targeted patches keep their current receipt shape, and legacy
-    SKILL.md-only entries (the shape a hollow readback mistakes for a receipt)
-    remain readable - the record shape has not changed (criterion 2 + 3)."""
+    """SKILL.md-targeted patches keep their current receipt shape; a fresh no-op append
+    stores the receipt row with EMPTY manifests, and legacy full-manifest rows written by
+    older code still read back verbatim (criterion 2 + 3, round-3 no-op contract)."""
     from tools import skill_ledger
     from tools.skill_manager_tool import skill_manage
 
@@ -190,16 +190,29 @@ def test_skill_md_patch_behaviour_and_legacy_entry_readability(ledger_env):
     assert str(skill_md) in amap, "SKILL.md patch receipt names SKILL.md"
     assert bmap[str(skill_md)] != amap[str(skill_md)]
 
-    # Legacy hollow-shape entry (SKILL.md only, identical before/after pair):
-    # still readable and parseable.
-    legacy_id = skill_ledger.append_entry(
+    # A fresh no-op append (SKILL.md only, identical before/after pair) keeps the receipt
+    # row but stores NO manifest entries: nothing changed, so there is nothing to restore
+    # and no restore instruction that could rewind a later edit.
+    noop_id = skill_ledger.append_entry(
         "patch", "my-skill",
         before=[{"path": str(skill_md), "sha256": "a" * 64}],
         after=[{"path": str(skill_md), "sha256": "a" * 64}])
-    assert legacy_id is not None
-    reread = skill_ledger.get_entry(legacy_id)
-    assert reread["before"][0]["path"] == str(skill_md)
-    assert reread["after"][0]["sha256"] == "a" * 64
+    assert noop_id is not None
+    reread = skill_ledger.get_entry(noop_id)
+    assert reread["action"] == "patch" and reread["skill"] == "my-skill"
+    assert reread["before"] == [] and reread["after"] == [], \
+        "a no-op write must not create before/after manifest entries"
+
+    # Legacy full-manifest rows written by older code still parse and read back verbatim.
+    legacy_row = {"id": "legacy1234", "ts": "2026-01-01T00:00:00+00:00", "actor": "agent",
+                  "action": "patch", "skill": "my-skill", "evidence": {},
+                  "before": [{"path": str(skill_md), "sha256": "a" * 64}],
+                  "after": [{"path": str(skill_md), "sha256": "a" * 64}]}
+    with open(skill_ledger.ledger_path(), "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(legacy_row) + "\n")
+    legacy = skill_ledger.get_entry("legacy1234")
+    assert legacy["before"][0]["path"] == str(skill_md)
+    assert legacy["after"][0]["sha256"] == "a" * 64
 
 
 def test_rollback_refuses_paths_outside_hermes_home(ledger_env):

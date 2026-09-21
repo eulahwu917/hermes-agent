@@ -92,3 +92,65 @@ def test_gc_blobs_removes_only_unreferenced(ledger_home):
         fh.write("{broken\n")
     skill_ledger._store_blob(b"orphan two")
     assert skill_ledger.gc_blobs() == (0, 0)
+
+
+def test_noop_write_stores_no_manifest_entries_and_rollback_loses_nothing(ledger_home):
+    """A no-op write (identical nonempty before/after maps) stores the receipt row with
+    EMPTY manifests — zero restore instructions — and rolling it back later cannot undo a
+    subsequent independent edit (control for the round-2 'hollow retention' defect)."""
+    from tools import skill_ledger
+    skills = ledger_home / "skills"
+    sk = skills / "big" / "SKILL.md"
+    ref = skills / "big" / "references" / "a.md"
+    maps = _manifest(skills, "big", **{"SKILL.md": "v1", "references/a.md": "same"})
+    noop_id = skill_ledger.append_entry("patch", "big", before=maps, after=maps, actor="agent")
+
+    entry = skill_ledger.get_entry(noop_id)
+    assert entry["before"] == [] and entry["after"] == [], (
+        "a no-op write must not create before/after manifest (restore-instruction) entries")
+    assert entry["action"] == "patch" and entry["skill"] == "big", (
+        "the no-op receipt row itself stays readable/attributable")
+
+    # Lay the after-state on disk, then make a LATER independent edit to a.md.
+    for i in maps:
+        p = Path(i["path"])
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(skill_ledger.read_blob(i["sha256"]))
+    ref.write_text("later edit", encoding="utf-8")
+
+    ok, msg = skill_ledger.rollback_entry(noop_id)
+    assert ok, msg
+    assert ref.read_text(encoding="utf-8") == "later edit", (
+        "rolling back the no-op must not restore paths the delta never changed")
+    assert sk.read_text(encoding="utf-8") == "v1"
+    assert "0 file(s) restored" in msg
+
+
+def test_rollback_of_legacy_full_manifest_noop_does_not_rewind_later_edits(ledger_home):
+    """Entries recorded in the OLD full-manifest no-op shape stay readable, but rolling one
+    back restores nothing: the restore set is the entry's own delta, so a later independent
+    edit survives (rollback-side guard, independent of the append-side fix)."""
+    from tools import skill_ledger
+    skills = ledger_home / "skills"
+    sk = skills / "big" / "SKILL.md"
+    ref = skills / "big" / "references" / "a.md"
+    maps = _manifest(skills, "big", **{"SKILL.md": "v1", "references/a.md": "same"})
+    legacy = {"id": "legacynoop1", "ts": "2026-01-01T00:00:00+00:00", "actor": "agent",
+              "action": "patch", "skill": "big", "evidence": {},
+              "before": maps, "after": [dict(i) for i in maps]}
+    with open(skill_ledger.ledger_path(), "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(legacy) + "\n")
+    assert skill_ledger.get_entry("legacynoop1")["before"] == maps  # rows remain readable
+
+    for i in maps:
+        p = Path(i["path"])
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(skill_ledger.read_blob(i["sha256"]))
+    ref.write_text("later edit", encoding="utf-8")
+
+    ok, msg = skill_ledger.rollback_entry("legacynoop1")
+    assert ok, msg
+    assert ref.read_text(encoding="utf-8") == "later edit", (
+        "a legacy full-manifest no-op must not become a restore instruction for unchanged files")
+    assert sk.read_text(encoding="utf-8") == "v1"
+    assert "0 file(s) restored" in msg
