@@ -9213,7 +9213,9 @@
           "add",
           "remove",
           "pause",
-          "resume"
+          "resume",
+          "list_attention",
+          "ack_attention"
         ],
         "title": "CronAction",
         "type": "string"
@@ -9702,6 +9704,50 @@
             ],
             "default": null,
             "title": "Profile"
+          },
+          "open_only": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Open Only"
+          },
+          "state": {
+            "anyOf": [
+              {},
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "State"
+          },
+          "kind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Kind"
+          },
+          "id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Id"
           }
         },
         "title": "CronManageParams",
@@ -33872,6 +33918,18 @@
           "name": "payload",
           "schema": {
             "$ref": "#/components/schemas/TerminalOutputPayload"
+          }
+        }
+      ]
+    },
+    {
+      "name": "attention.changed",
+      "summary": "An Attention commit (ack) touched the sentinel; refetch the attention list.",
+      "params": [
+        {
+          "name": "payload",
+          "schema": {
+            "$ref": "#/components/schemas/ChangeSignalPayload"
           }
         }
       ]

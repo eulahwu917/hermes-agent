@@ -3231,8 +3231,12 @@ export interface CronManageParams {
   continuity?: boolean | string | null
   deliver?: string | null
   profile?: string | null
+  open_only?: unknown | null
+  state?: unknown | null
+  kind?: string | null
+  id?: string | null
 }
-export type CronAction = 'list' | 'add' | 'remove' | 'pause' | 'resume'
+export type CronAction = 'list' | 'add' | 'remove' | 'pause' | 'resume' | 'list_attention' | 'ack_attention'
 /** Pass-through of ``tools/cronjob_tools.py::cronjob`` JSON: ``list`` → ``jobs``/``count`` (+ ``scoped`` when profile-scoped); ``add`` → the created job's summary + ``job``; ``remove`` → ``removed_job``; ``pause``/``resume`` → ``job``. A tool-level failure lands in ``error``. */
 export interface CronManageResult {
   success?: boolean | null
@@ -4900,6 +4904,8 @@ export const SERVER_REQUEST_METHODS = [
 export interface BackendGatewayEventMap {
   /** Output chunk from an agent-owned background process. */
   'agent.terminal.output': TerminalOutputPayload
+  /** An Attention commit (ack) touched the sentinel; refetch the attention list. */
+  'attention.changed': ChangeSignalPayload
   /** A /background side agent finished. */
   'background.complete': SideAgentCompletePayload
   /** Device-flow URL + code for the billing scope step-up; the client opens the browser. */
@@ -5040,6 +5046,7 @@ export interface BackendGatewayEventMap {
 export type BackendGatewayEventName = keyof BackendGatewayEventMap
 export const GATEWAY_EVENT_TYPES = [
   'agent.terminal.output',
+  'attention.changed',
   'background.complete',
   'billing.step_up.verification',
   'bot_relay.outbox.pending',

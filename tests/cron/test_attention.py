@@ -714,18 +714,22 @@ def test_e4_alert_event_ack_and_union(cron_env, production_rows, monkeypatch):
     err = _rpc_error(action="ack_attention", kind="banana", id="alpharelay_ev1")
     assert err["code"] == 4066
 
-    # Raw→wire mapping table pins (E4): detected/alerted → open; closed → closed.
+    # Raw→wire mapping table pins (E4): detected/alerted → open; resolved/closed → closed.
     d_id, _ = incidents.upsert_incident("zz-test-e4", "map me detected")
     a_id, _ = incidents.upsert_incident("zz-test-e4", "map me alerted")
     incidents.set_incident_state(a_id, "alerted")
     c_id, _ = incidents.upsert_incident("zz-test-e4", "map me closed")
     incidents.ack_incident(c_id)
+    r_id, _ = incidents.upsert_incident("zz-test-e4-resolved", "map me resolved")
+    incidents.close_incidents_for_recovered_job("zz-test-e4-resolved")  # r_id (detected) → resolved
     wire = {i["id"]: i for i in _rpc_ok(action="list_attention", open_only=False)["items"]}
     assert wire[d_id]["state"] == "open"  # raw detected → wire open
     assert wire[a_id]["state"] == "open"  # raw alerted → wire open
     assert wire[c_id]["state"] == "closed"  # raw closed → wire closed
     assert "closed_at" not in wire[c_id]  # closed_at stays raw-only
     assert wire[c_id]["acked_at"]  # acked_at is wire-visible
+    assert wire[r_id]["state"] == "closed"  # raw resolved (recovered) → wire closed, not open
+    assert wire[r_id]["acked_at"] is None  # resolved is auto-recovery, never an operator ack
 
 
 # ===============================================================================================

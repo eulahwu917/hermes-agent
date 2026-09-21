@@ -68,6 +68,7 @@ export function notifyPairingChanged(): void {
 
 export function notifySetupReady(): void {
   $setupReadyTick.set($setupReadyTick.get() + 1)
+}
 export function notifyAttentionChanged(): void {
   $attentionChangeTick.set($attentionChangeTick.get() + 1)
 }

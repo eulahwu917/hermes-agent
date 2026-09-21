@@ -3,6 +3,7 @@
 import json
 import queue
 import threading
+import time
 from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -12,6 +13,7 @@ import pytest
 from run_agent import AIAgent
 from gateway.session_context import clear_session_vars
 from tools import approval
+from tools import approval as approval_module
 from tools.thread_context import propagate_context_to_thread
 
 
@@ -144,6 +146,63 @@ def test_desktop_publishes_final_commands_before_wait_and_runs_in_order(tmp_path
             worker.join(timeout=5)
             cleanup_vm(key)
             clear_session_vars(tokens)
+
+
+def test_prepared_guard_reruns_value_tracking_at_the_effective_workdir(tmp_path, monkeypatch):
+    """R3 regression: a Desktop-prepped consent (cached against the recorded session cwd) must
+    not bypass the carried cwd-sensitive denied-value inspection when execution resolves a
+    different EFFECTIVE workdir. A/run.sh is innocuous; B/run.sh carries a previously denied
+    override — the cached "approved" must NOT be returned for B."""
+    from agent import terminal_approval_batch as tab
+    from tools.approval_context import _approval_tool_call_id, reset_current_session_key, set_current_session_key
+
+    monkeypatch.setenv("HERMES_SINGLE_QUERY_SESSION", "1")
+    monkeypatch.setattr("tools.approval._tirith_scan", lambda command: {"action": "allow"})
+    session_token = set_current_session_key("desktop-batch-cwd-regression")
+    approval_module._denied_env_overrides.clear()
+    approved_entry = {"approved": True, "message": None}
+    try:
+        # Recorded cwd A (innocuous) vs per-call workdir B (carries the denied override).
+        a_dir = tmp_path / "A"
+        b_dir = tmp_path / "B"
+        a_dir.mkdir()
+        b_dir.mkdir()
+        (a_dir / "run.sh").write_text("echo innocuous\n", encoding="utf-8")
+        denied_val = "/srv/personal/scratch/denied/effective-cwd/value"
+        (b_dir / "run.sh").write_text(f"export PYTHONPATH={denied_val}\n", encoding="utf-8")
+        # Seed the denial for THIS session (as if the inline form was denied earlier).
+        approval_module._denied_env_overrides["desktop-batch-cwd-regression"] = {
+            ("PYTHONPATH", denied_val): time.time()}
+
+        # A minimal prepared slot: cached decision computed against cwd A at preparation time.
+        slot = SimpleNamespace(
+            preparing=False,
+            batch=SimpleNamespace(cancelled=threading.Event(), task_id="t",
+                                  agent=SimpleNamespace(_interrupt_requested=False)),
+            parsed=SimpleNamespace(ref=lambda _task: SimpleNamespace(call_id="call-1")),
+            guard_key=("bash run.sh", "local", False),
+            decision=approved_entry,
+        )
+
+        def check_cancelled():
+            pass
+
+        slot.check_cancelled = check_cancelled
+        slot_token = tab._slot.set(slot)
+        call_token = _approval_tool_call_id.set("call-1")
+        try:
+            # Execution resolves the EFFECTIVE workdir B; the guard must see B/run.sh's denied value.
+            result = approval_module.check_all_command_guards(
+                "bash run.sh", "local", command_cwd=str(b_dir))
+            assert result["approved"] is False, "cached consent must not skip the effective-cwd value check"
+            assert "denied earlier in this session" in result["message"]
+            assert denied_val in result["message"] and str(b_dir / "run.sh") in result["message"]
+        finally:
+            _approval_tool_call_id.reset(call_token)
+            tab._slot.reset(slot_token)
+    finally:
+        approval_module._denied_env_overrides.clear()
+        reset_current_session_key(session_token)
 
 
 def test_cancelled_preparation_drains_requests_without_reusing_once(tmp_path, monkeypatch):

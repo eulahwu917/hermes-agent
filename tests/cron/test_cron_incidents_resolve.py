@@ -41,11 +41,18 @@ def test_successful_run_resolves_open_incidents_and_a_repeat_reopens_them(monkey
 
 
 def test_operator_ack_survives_a_successful_run(monkeypatch, tmp_path):
+    """A successful run never touches an operator-closed ack, and the closed episode stays
+    closed while a recurrence of the SAME signature mints a NEW open episode (episodic re-arm —
+    one ack must never permanently suppress a repeating alarm; the local design supersedes the
+    upstream permanent-suppression pin)."""
     inc = _point_db(monkeypatch, tmp_path)
     inc_id, _ = inc.upsert_incident("job-1", "known flaky")
     inc.ack_incident(inc_id)
 
     assert inc.close_incidents_for_recovered_job("job-1") == 0
     assert inc.get_incident(inc_id)["state"] == "closed"
-    _, reopened = inc.upsert_incident("job-1", "known flaky")
-    assert reopened is False and inc.get_incident(inc_id)["state"] == "closed"
+
+    rearmed_id, is_new = inc.upsert_incident("job-1", "known flaky")
+    assert is_new is True and rearmed_id != inc_id  # a fresh episode, not the closed row reopened
+    assert inc.get_incident(inc_id)["state"] == "closed"  # the acked episode stays closed
+    assert inc.get_incident(rearmed_id)["state"] == "detected"

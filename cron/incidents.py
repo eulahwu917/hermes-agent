@@ -166,13 +166,17 @@ def upsert_incident(
 
     with _transaction() as conn:
         open_row = conn.execute(
-            """SELECT id FROM cron_incidents
+            """SELECT id, state FROM cron_incidents
                WHERE job_id=? AND error_sig=? AND state != 'closed'
                ORDER BY last_seen_at DESC, id DESC LIMIT 1""",
             (job_id, sig),
         ).fetchone()
         if open_row is not None:
             incident_id = open_row["id"]
+            # A ``resolved`` row (job recovered, then broke the same way again) re-opens as
+            # ``detected`` so the operator is alerted once more; report that re-open to the
+            # caller instead of a bare refresh.
+            reopened = open_row["state"] == "resolved"
             conn.execute(
                 """UPDATE cron_incidents
                    SET last_seen_at=?, error=?, output_file=?,
@@ -182,7 +186,7 @@ def upsert_incident(
                    WHERE id=?""",
                 (now, stored_error, output_file, incident_id),
             )
-            return incident_id, False
+            return incident_id, reopened
         # No OPEN row for this signature: closed episodes stay closed — episodic re-arm
         # mints a fresh episode row so one ack can never permanently suppress a repeating
         # alarm (live-money/backup class). Episode ids extend the base id monotonically.

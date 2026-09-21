@@ -639,6 +639,18 @@ def append_entry(
         chain_state = None
         with suppress(Exception):
             chain_state = _annotate_chain_break(entry, chain_basis)
+        # Persist the changed-path delta (upstream: rollback writes every *before* path, so
+        # unchanged files are dead weight). The annotation above ran on the FULL maps and the
+        # sidecar record below stores the full *after* map, so shrinking the on-disk receipt does
+        # not weaken the chain comparison. A no-op/"hollow" entry (nothing actually changed — the
+        # legacy shape a hollow readback mistakes for a receipt) keeps its rows verbatim, so it
+        # stays readable instead of collapsing to nothing; ``pre-rollback`` always stays full.
+        if action != "pre-rollback":
+            changed_before, changed_after = _delta(entry["before"], entry["after"])
+            hollow = bool(entry["before"] and entry["after"]
+                          and not changed_before and not changed_after)
+            if not hollow:
+                entry["before"], entry["after"] = changed_before, changed_after
         path = ledger_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "a", encoding="utf-8") as fh:

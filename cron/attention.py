@@ -208,7 +208,9 @@ def _map_cron_incident(row: Dict[str, Any], job_names: Dict[str, str]) -> Dict[s
         "body_excerpt": file_excerpt if file_excerpt is not None else _excerpt(row.get("error")),
         "first_seen_at": row.get("first_seen_at"),
         "last_seen_at": row.get("last_seen_at"),
-        "state": "closed" if raw_state == "closed" else "open",
+        # Wire vocabulary is open/closed. ``resolved`` (job recovered) is not operator action
+        # pending, so it maps to closed — a recovered incident must not surface as an open alarm.
+        "state": "open" if raw_state in ("detected", "alerted") else "closed",
         "acked_at": row.get("acked_at"),
         "evidence_ref": row.get("output_file"),
         # kind-specific metadata

@@ -1466,7 +1466,16 @@ def check_all_command_guards(command: str, env_type: str,
     from agent.terminal_approval_batch import consume_prepared_guard
     prepared = consume_prepared_guard(command, env_type, has_host_access)
     if prepared is not None:
-        return prepared
+        # A prepared consent was computed against the cwd visible during preparation (the
+        # recorded session cwd). The carried cwd-sensitive denied-value inspection must run
+        # against the EFFECTIVE execution cwd regardless: a batch slot whose per-call workdir
+        # differs (or whose recorded cwd changed since) would otherwise inherit a decision
+        # that never scanned the directory the command actually runs in.
+        if not _reappearing_denied_overrides(command, command_cwd,
+                                             inspect_local_scripts=inspect_local_scripts):
+            return prepared
+        # A previously denied value re-appears in the effective cwd — fall through so the
+        # normal value-tracked finding/prompt path runs against the real directory.
 
     approval_mode = approval_context._get_approval_mode()
     if _yolo_active() or approval_mode == "off":
